@@ -1,0 +1,14 @@
+*
+!/.gitignore
+!/go.mod
+!/go.sum
+!/README.md
+
+!/cmd/
+!/cmd/gcp-token/
+!/cmd/tpm-keygen/
+!/cmd/**/*.go
+
+!/pkg/
+!/pkg/**/
+!/pkg/**/*.go
