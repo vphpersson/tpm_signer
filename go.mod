@@ -1,6 +1,6 @@
 module github.com/vphpersson/tpm_signer
 
-go 1.26.6
+go 1.27
 
 require (
 	github.com/altshiftab/utils_go v1.31.0
