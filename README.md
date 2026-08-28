@@ -48,6 +48,24 @@ terraform plan
 
 `gcloud` reads the same token from `CLOUDSDK_AUTH_ACCESS_TOKEN`. Tokens are cached under `XDG_RUNTIME_DIR`, which is tmpfs, so the PIN is asked for roughly once an hour rather than once per command, and nothing survives a reboot.
 
+## In a long-running program
+
+`gcp-token` suits a command line: mint a token, run one thing, exit. A daemon needs more, because a token lasts an hour and one handed to it at startup stops working an hour later. The usual answer is to give the process a service account key file instead -- which is the bearer credential this exists to remove.
+
+`gcp.NewTokenSource` is the other shape. It satisfies utils_go's `token_source.TokenSource`, so it drops into anything that already takes one, and it mints again when the token it holds is nearly spent:
+
+```go
+tokenSource, err := gcp.NewTokenSource(ctx, &gcp.TokenSourceOptions{
+    KeyPath:        "/etc/tpm-signer/poller.tpm",
+    ServiceAccount: "poller@project.iam.gserviceaccount.com",
+    Scopes:         []string{"https://www.googleapis.com/auth/pubsub"},
+})
+```
+
+The signer opens the TPM per signature and closes it again, so holding the source for the life of a process holds no handle on the device. Concurrent callers are serialised, so a burst costs one signature rather than one each -- which matters, since a signature is about half a second on an fTPM.
+
+Under systemd this wants `SupplementaryGroups=tss` or membership in that group, and in a container `AddDevice=/dev/tpmrm0`. Use a key created with `--no-pin`: nothing can answer a prompt at three in the morning.
+
 ## The PIN
 
 The PIN is the key's TPM auth value, not a passphrase over an encrypted file. It is never sent to the chip in the clear: the session is salted to the storage root key and encrypts command parameters, so the PIN only ever keys an HMAC.
