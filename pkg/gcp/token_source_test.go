@@ -10,7 +10,8 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
-	"time"
+
+	"github.com/altshiftab/utils_go/pkg/oauth2/types/token_source"
 )
 
 // A software key stands in for the TPM's: the package takes a crypto.Signer, so
@@ -58,24 +59,34 @@ func mintingServer(t *testing.T, expiresIn int) (*Client, func() int) {
 	}
 }
 
-func newTestTokenSource(t *testing.T, client *Client, refreshMargin time.Duration) *TokenSource {
+// newTestMinter is the minting half on its own, which mints every time it is
+// asked.
+func newTestMinter(t *testing.T, client *Client) *tokenMinter {
 	t.Helper()
 
-	return &TokenSource{
+	return &tokenMinter{
 		ctx:            t.Context(),
 		signer:         testSigner(t),
 		client:         client,
 		serviceAccount: "poller@example.iam.gserviceaccount.com",
 		scopes:         []string{ScopeCloudPlatform},
-		refreshMargin:  refreshMargin,
 	}
+}
+
+// newTestTokenSource is the whole thing as NewTokenSource composes it, minus
+// the key file a real one reads.
+func newTestTokenSource(t *testing.T, client *Client) token_source.TokenSource {
+	t.Helper()
+
+	minter := newTestMinter(t, client)
+	return newTokenSource(minter.ctx, minter.signer, minter.client, minter.serviceAccount, minter.scopes)
 }
 
 func TestTokenSourceMintsOnceWhileValid(t *testing.T) {
 	t.Parallel()
 
 	client, mints := mintingServer(t, 3600)
-	source := newTestTokenSource(t, client, DefaultRefreshMargin)
+	source := newTestTokenSource(t, client)
 
 	first, err := source.Token()
 	if err != nil {
@@ -108,11 +119,11 @@ func TestTokenSourceMintsOnceWhileValid(t *testing.T) {
 func TestTokenSourceMintsAgainWhenSpent(t *testing.T) {
 	t.Parallel()
 
-	// A token good for a minute, wanted with five minutes to spare: every call
-	// finds it spent. This is the case a daemon meets after an hour, which is
-	// the whole reason the source exists.
-	client, mints := mintingServer(t, 60)
-	source := newTestTokenSource(t, client, DefaultRefreshMargin)
+	// A token already expired when it arrives, so every call finds it spent.
+	// This is the case a daemon meets after an hour, which is the whole reason
+	// the source exists.
+	client, mints := mintingServer(t, -1)
+	source := newTestTokenSource(t, client)
 
 	first, err := source.Token()
 	if err != nil {
@@ -136,7 +147,7 @@ func TestTokenSourceMintsOnceUnderConcurrentCallers(t *testing.T) {
 	t.Parallel()
 
 	client, mints := mintingServer(t, 3600)
-	source := newTestTokenSource(t, client, DefaultRefreshMargin)
+	source := newTestTokenSource(t, client)
 
 	var waitGroup sync.WaitGroup
 	for range 16 {
@@ -163,10 +174,10 @@ func TestTokenSourceRefusesACancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	source := newTestTokenSource(t, client, DefaultRefreshMargin)
-	source.ctx = ctx
+	minter := newTestMinter(t, client)
+	minter.ctx = ctx
 
-	if _, err := source.Token(); err == nil {
+	if _, err := token_source.NewReusable(nil, minter).Token(); err == nil {
 		t.Error("expected an error")
 	}
 	if got := mints(); got != 0 {

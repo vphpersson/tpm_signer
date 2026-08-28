@@ -52,7 +52,7 @@ terraform plan
 
 `gcp-token` suits a command line: mint a token, run one thing, exit. A daemon needs more, because a token lasts an hour and one handed to it at startup stops working an hour later. The usual answer is to give the process a service account key file instead -- which is the bearer credential this exists to remove.
 
-`gcp.NewTokenSource` is the other shape. It satisfies utils_go's `token_source.TokenSource`, so it drops into anything that already takes one, and it mints again when the token it holds is nearly spent:
+`gcp.NewTokenSource` is the other shape. It satisfies utils_go's `token_source.TokenSource`, so it drops into anything that already takes one, and it mints again when the token it holds has run down:
 
 ```go
 tokenSource, err := gcp.NewTokenSource(ctx, &gcp.TokenSourceOptions{
@@ -62,7 +62,9 @@ tokenSource, err := gcp.NewTokenSource(ctx, &gcp.TokenSourceOptions{
 })
 ```
 
-The signer opens the TPM per signature and closes it again, so holding the source for the life of a process holds no handle on the device. Concurrent callers are serialised, so a burst costs one signature rather than one each -- which matters, since a signature is about half a second on an fTPM.
+What it returns is a minter wrapped in utils_go's `NewReusable`, which is where every other token source in that library leaves the question: reuse and the mutex around it are already written there, and a source that cached on its own would be a second copy of them. So a burst of callers costs one signature rather than one each -- which matters, since a signature is about half a second on an fTPM.
+
+The signer opens the TPM per signature and closes it again, so holding the source for the life of a process holds no handle on the device.
 
 Under systemd this wants `SupplementaryGroups=tss` or membership in that group, and in a container `AddDevice=/dev/tpmrm0`. Use a key created with `--no-pin`: nothing can answer a prompt at three in the morning.
 
