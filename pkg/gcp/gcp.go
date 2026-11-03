@@ -12,6 +12,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -88,6 +89,14 @@ func Assertion(
 ) (string, error) {
 	if signer == nil {
 		return "", nil_error.New("signer")
+	}
+	// An ECC key would sign happily and be refused by Google afterwards, a round trip and a TPM
+	// signature later, with an error that does not say why.
+	if _, isRSA := signer.Public().(*rsa.PublicKey); !isRSA {
+		return "", altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: google accepts only RSA keys", altshiftErrors.ErrValidationError),
+			fmt.Sprintf("%T", signer.Public()),
+		)
 	}
 	if serviceAccount == "" {
 		return "", empty_error.New("service account")

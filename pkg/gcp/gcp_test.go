@@ -3,6 +3,8 @@ package gcp
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -34,6 +36,11 @@ func TestAssertion(t *testing.T) {
 	key := softwareKey(t)
 	now := time.Unix(1_700_000_000, 0)
 
+	eccKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
 	testCases := []struct {
 		name           string
 		signer         crypto.Signer
@@ -57,6 +64,14 @@ func TestAssertion(t *testing.T) {
 			lifetime:       30 * time.Minute,
 		},
 		{name: "nil signer", serviceAccount: "a@b.com", scopes: []string{ScopeCloudPlatform}, lifetime: time.Hour, expectErr: true},
+		{
+			name:           "ecc key is refused before signing",
+			signer:         eccKey,
+			serviceAccount: "a@b.com",
+			scopes:         []string{ScopeCloudPlatform},
+			lifetime:       time.Hour,
+			expectErr:      true,
+		},
 		{name: "no service account", signer: key, scopes: []string{ScopeCloudPlatform}, lifetime: time.Hour, expectErr: true},
 		{name: "no scopes", signer: key, serviceAccount: "a@b.com", lifetime: time.Hour, expectErr: true},
 		{name: "zero lifetime", signer: key, serviceAccount: "a@b.com", scopes: []string{ScopeCloudPlatform}, expectErr: true},

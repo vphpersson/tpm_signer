@@ -19,9 +19,23 @@ The access token this mints is still a bearer token. It lives in RAM and in the 
 
 The boundary between `pkg/signer` and `pkg/gcp` is stdlib `crypto.Signer`. Nothing above the signer depends on TPM code, which is why the same assertion logic would serve a YubiKey, a PKCS#11 token, or a file-based key without modification.
 
-## Why RSA
+## Key types
 
-Google accepts only RSA service account keys and signs assertions only with RS256, so the key is RSA-2048 despite P-256 being faster and pleasanter in every other respect. Key creation takes a few seconds; each signature takes about half a second on an AMD fTPM. That is once per hour in practice, since tokens are cached until they expire.
+`tpm-keygen --type` picks one of two:
+
+| type | for | |
+| --- | --- | --- |
+| `rsa-2048` (default) | Google | Google accepts only RSA service account keys and signs assertions only with RS256. |
+| `ecc-p256` | ES256, anywhere else | Quicker to create, and a signature is 70-odd bytes rather than 256. |
+
+Both are created with a null scheme, and `Sign` chooses at sign time: RSASSA-PKCS1-v1_5 or ECDSA, over a SHA-256 digest either way. An ECDSA signature comes back ASN.1 DER encoded, as `crypto.Signer` requires and as `ecdsa.VerifyASN1` and `crypto/x509` read it; a JWS wants the fixed-width `r || s` instead, and converting is the caller's job, as it is for any other `crypto.Signer`. `gcp.Assertion` refuses a non-RSA signer up front rather than let Google refuse the result.
+
+Timings, per operation, including re-deriving the storage root key each time:
+
+| chip | create RSA | create P-256 | sign RSA | sign P-256 |
+| --- | --- | --- | --- | --- |
+| capa, AMD fTPM | ~4.2 s | not measured | ~0.5 s | not measured |
+| saviour, Infineon discrete | ~1.3 s | ~1.0 s | ~1.4 s | ~1.2 s |
 
 ## Use
 
@@ -31,7 +45,19 @@ Create the key. This is the only interactive step, and it asks for a PIN twice:
 tpm-keygen --subject tpm-signer-altshift
 ```
 
-It writes two files: `gcp.tpm`, the key, useless anywhere else; and `gcp.crt`, a self-signed certificate carrying the public half, which is the shape Google's upload endpoint wants. The certificate's validity bounds the uploaded key's life, so `--days` is a real expiry rather than decoration.
+It writes two files: `gcp.tpm`, the key, useless anywhere else; and `gcp.crt`, a self-signed certificate carrying the public half, which is the shape Google's upload endpoint wants. The certificate's validity bounds the uploaded key's life, so `--days` is a real expiry rather than decoration. `--public-key-file` writes the public half a third time, as a PKIX `PUBLIC KEY` PEM.
+
+`tpm-keygen` never overwrites a file. A key's public half may already be registered somewhere, and a second key in its place would lose the first for good; an old certificate overwritten by a new one would have the next upload register the wrong key. Every output path is checked before the PIN is asked for, and a run that fails part-way removes what it wrote, so it leaves no key file whose public half went nowhere.
+
+An ECC key for something unattended, exporting the public half where a service registering API keys wants it:
+
+```sh
+tpm-keygen --type ecc-p256 --no-pin \
+    --key-file ~/.config/tpm-signer/job.tpm \
+    --public-key-file ~/.config/tpm-signer/job.pub.pem
+```
+
+An ECC key gets no certificate unless `--cert-file` is given, since Google would refuse it; one of the two output files is required, or there would be no way to get the public half out.
 
 Register the public half against a service account:
 
@@ -72,15 +98,17 @@ Under systemd this wants `SupplementaryGroups=tss` or membership in that group, 
 
 The PIN is the key's TPM auth value, not a passphrase over an encrypted file. It is never sent to the chip in the clear: the session is salted to the storage root key and encrypts command parameters, so the PIN only ever keys an HMAC.
 
-Because the key is created with `NoDA` false, it sits under the TPM's dictionary attack lockout. On the machine this was developed against:
+Because a key with a PIN is created with `NoDA` false, it sits under the TPM's dictionary attack lockout. On the machines it runs on:
 
-| parameter | value |
-| --- | --- |
-| failures before lockout | 31 |
-| one failure forgiven every | 10 minutes |
-| lockout recovery | 24 hours |
+| parameter | capa (AMD fTPM) | saviour (Infineon) |
+| --- | --- | --- |
+| failures before lockout | 31 | 32 |
+| one failure forgiven every | 10 minutes | 2 hours |
+| lockout recovery | 24 hours | 24 hours |
 
-That is roughly 144 guesses per day after the initial allowance, which is what makes a six-digit PIN defensible here in a way a six-character password would not be anywhere else. Read the values for a given chip with `TestDAParams`-style `GetCapability` calls rather than assuming these.
+That is roughly 144 guesses per day on capa after the initial allowance, which is what makes a six-digit PIN defensible here in a way a six-character password would not be anywhere else. Read the values for a given chip with `GetCapability` on `TPM_PT_MAX_AUTH_FAIL` and its neighbours rather than assuming these.
+
+A key made with `--no-pin` is created with `NoDA` set instead. With no auth value there is nothing to guess, so the lockout would protect nothing, and it would let failed PINs against other keys on the same chip lock an unattended job out for a day.
 
 A PIN defends against something running in the background as you. It does not defend against an attacker who is already present and can keylog it, or who waits until you have entered it and uses the loaded key. `--no-pin` is available and matches how `ssh-tpm-agent` keys are normally configured; it is the right choice when the threat is a stolen laptop rather than local malware.
 
@@ -91,4 +119,4 @@ go test ./...                                             # no hardware needed
 TPM_SIGNER_LIVE=1 go test ./pkg/signer/ -run TestLive -v   # drives the real chip
 ```
 
-The live test is opt-in because it generates a key, which takes seconds, and because its wrong-PIN case deliberately increments the dictionary attack counter.
+The live test is opt-in because it generates a key of each kind, which takes seconds, and because its wrong-PIN case deliberately increments the dictionary attack counter; `-skip 'TestLive/.*/wrong_pin'` leaves the counter alone on a chip that other things depend on.

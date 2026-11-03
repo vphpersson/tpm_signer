@@ -2,16 +2,24 @@ package gcp
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json/v2"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
 	"github.com/altshiftab/utils_go/pkg/oauth2/types/token_source"
+	"github.com/google/go-tpm/tpm2"
+
+	"github.com/vphpersson/tpm_signer/pkg/keyfile"
+	"github.com/vphpersson/tpm_signer/pkg/signer"
 )
 
 // A software key stands in for the TPM's: the package takes a crypto.Signer, so
@@ -185,8 +193,61 @@ func TestTokenSourceRefusesACancelledContext(t *testing.T) {
 	}
 }
 
+// writeKeyFile writes a no-PIN key file around a software key's public half, enough for
+// NewTokenSource to load: nothing touches the TPM until the first token is asked for.
+func writeKeyFile(t *testing.T, keyType signer.KeyType) string {
+	t.Helper()
+
+	template, err := signer.KeyTemplate(keyType, true)
+	if err != nil {
+		t.Fatalf("key template: %v", err)
+	}
+
+	switch keyType {
+	case signer.KeyTypeRSA2048:
+		template.Unique = tpm2.NewTPMUPublicID(tpm2.TPMAlgRSA, &tpm2.TPM2BPublicKeyRSA{Buffer: testSigner(t).N.Bytes()})
+	case signer.KeyTypeECCP256:
+		software, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatalf("generate key: %v", err)
+		}
+		point, err := software.PublicKey.Bytes()
+		if err != nil {
+			t.Fatalf("public key bytes: %v", err)
+		}
+		template.Unique = tpm2.NewTPMUPublicID(tpm2.TPMAlgECC, &tpm2.TPMSECCPoint{
+			X: tpm2.TPM2BECCParameter{Buffer: point[1:33]},
+			Y: tpm2.TPM2BECCParameter{Buffer: point[33:]},
+		})
+	default:
+		t.Fatalf("no key file for %s", keyType)
+	}
+
+	public := tpm2.New2B(*template)
+	private := tpm2.TPM2BPrivate{Buffer: []byte{0xde, 0xad, 0xbe, 0xef}}
+	encoded, err := (&keyfile.Key{
+		EmptyAuth: true,
+		Parent:    0x40000001,
+		Public:    tpm2.Marshal(&public),
+		Private:   tpm2.Marshal(&private),
+	}).Marshal()
+	if err != nil {
+		t.Fatalf("marshal key file: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), string(keyType)+".tpm")
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+
+	return path
+}
+
 func TestNewTokenSource(t *testing.T) {
 	t.Parallel()
+
+	rsaKeyPath := writeKeyFile(t, signer.KeyTypeRSA2048)
+	eccKeyPath := writeKeyFile(t, signer.KeyTypeECCP256)
 
 	testCases := []struct {
 		name    string
@@ -202,6 +263,21 @@ func TestNewTokenSource(t *testing.T) {
 		{
 			name:    "no service account",
 			options: &TokenSourceOptions{KeyPath: "/nonexistent"},
+			wantErr: true,
+		},
+		{
+			name: "an rsa key file",
+			options: &TokenSourceOptions{
+				KeyPath:        rsaKeyPath,
+				ServiceAccount: "a@example.iam.gserviceaccount.com",
+			},
+		},
+		{
+			name: "an ecc key file is refused at construction",
+			options: &TokenSourceOptions{
+				KeyPath:        eccKeyPath,
+				ServiceAccount: "a@example.iam.gserviceaccount.com",
+			},
 			wantErr: true,
 		},
 		{

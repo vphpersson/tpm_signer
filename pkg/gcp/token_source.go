@@ -3,6 +3,7 @@ package gcp
 import (
 	"context"
 	"crypto"
+	"crypto/rsa"
 	"fmt"
 	"os"
 
@@ -133,6 +134,13 @@ func NewTokenSource(ctx context.Context, options *TokenSourceOptions) (token_sou
 	keySigner, err := signer.New(key, devicePath, options.PINProvider)
 	if err != nil {
 		return nil, altshiftErrors.New(fmt.Errorf("signer new: %w", err), options.ServiceAccount)
+	}
+	// Refused here, where a service starts, rather than at its first token an hour into running.
+	if _, isRSA := keySigner.Public().(*rsa.PublicKey); !isRSA {
+		return nil, altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: google accepts only RSA keys", altshiftErrors.ErrValidationError),
+			options.KeyPath,
+		)
 	}
 
 	scopes := options.Scopes
