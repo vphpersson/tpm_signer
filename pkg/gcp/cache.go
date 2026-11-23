@@ -6,10 +6,14 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
+	"syscall"
 
 	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
 	"github.com/altshiftab/utils_go/pkg/errors/types/empty_error"
@@ -111,9 +115,10 @@ func CachePath(key *CacheKey) (string, error) {
 	return filepath.Join(directory, "tpm-signer", hex.EncodeToString(sum[:16])+".json"), nil
 }
 
-// LoadToken reads a cached token. A missing or unreadable cache is not an error; it yields a nil
-// token, and the caller mints a fresh one. So does a cache file written for anything other than
-// the key asked for.
+// LoadToken reads a cached token. A missing or corrupt cache file is not an error; it yields a
+// nil token, and the caller mints a fresh one. So does a cache file written for anything other
+// than the key asked for, and one that is a link, or open to anyone else. A cache directory that
+// is not this user's alone is an error, since nothing written there would be safe either.
 func LoadToken(path string, key *CacheKey) (*Token, error) {
 	if path == "" {
 		return nil, empty_error.New("path")
@@ -122,12 +127,19 @@ func LoadToken(path string, key *CacheKey) (*Token, error) {
 		return nil, fmt.Errorf("validate cache key: %w", err)
 	}
 
-	data, err := os.ReadFile(path) //nolint:gosec // The path is CachePath's.
+	switch err := checkCacheDirectory(filepath.Dir(path)); {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, nil
+	case err != nil:
+		return nil, fmt.Errorf("check cache directory: %w", err)
+	}
+
+	data, err := readCacheFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("read cache: %w", err), path)
+		return nil, fmt.Errorf("read cache file: %w", err)
+	}
+	if data == nil {
+		return nil, nil
 	}
 
 	var entry cacheEntry
@@ -164,8 +176,9 @@ func StoreToken(path string, key *CacheKey, token *Token) error {
 		return nil_error.New("token")
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return altshiftErrors.NewWithTrace(fmt.Errorf("mkdir cache directory: %w", err), filepath.Dir(path))
+	directory := filepath.Dir(path)
+	if err := ensureCacheDirectory(directory); err != nil {
+		return fmt.Errorf("ensure cache directory: %w", err)
 	}
 
 	// The access token really is a secret. Writing it here is the deliberate trade: it goes to
@@ -177,8 +190,18 @@ func StoreToken(path string, key *CacheKey, token *Token) error {
 	}
 
 	// Written to a temporary file and renamed so a concurrent reader never sees a partial token.
-	temporary := path + ".tmp"
-	if err := os.WriteFile(temporary, data, 0o600); err != nil {
+	// CreateTemp opens with O_EXCL and mode 0600 under a name of its own choosing, so it never
+	// follows a link left in its way, and two processes minting at once each write their own file;
+	// the second rename replaces the first, and both succeed.
+	file, err := os.CreateTemp(directory, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return altshiftErrors.NewWithTrace(fmt.Errorf("create temp: %w", err), directory)
+	}
+	temporary := file.Name()
+
+	_, writeErr := file.Write(data)
+	if err := errors.Join(writeErr, file.Close()); err != nil {
+		_ = os.Remove(temporary)
 		return altshiftErrors.NewWithTrace(fmt.Errorf("write cache: %w", err), temporary)
 	}
 	if err := os.Rename(temporary, path); err != nil {
@@ -187,4 +210,99 @@ func StoreToken(path string, key *CacheKey, token *Token) error {
 	}
 
 	return nil
+}
+
+// maxCacheFileSize bounds what is read back; a cache entry is a few hundred bytes.
+const maxCacheFileSize = 64 << 10
+
+// ensureCacheDirectory creates the cache directory if it is not there, and then holds it to
+// checkCacheDirectory's rules either way.
+func ensureCacheDirectory(directory string) error {
+	err := os.Mkdir(directory, 0o700)
+	switch {
+	case err == nil:
+		// The umask can only narrow Mkdir's mode, but narrower than 0700 is no use either.
+		if err := os.Chmod(directory, 0o700); err != nil {
+			return altshiftErrors.NewWithTrace(fmt.Errorf("chmod: %w", err), directory)
+		}
+	case errors.Is(err, fs.ErrExist):
+	default:
+		return altshiftErrors.NewWithTrace(fmt.Errorf("mkdir: %w", err), directory)
+	}
+
+	return checkCacheDirectory(directory)
+}
+
+// checkCacheDirectory refuses a cache directory that is not this user's alone: a directory, not a
+// link to one, owned by this uid, with mode 0700. A token put there by anyone else would be handed
+// out as this user's, and one written where others can look is theirs to lift. The error wraps
+// fs.ErrNotExist when there is no directory at all.
+func checkCacheDirectory(directory string) error {
+	info, err := os.Lstat(directory)
+	if err != nil {
+		return altshiftErrors.NewWithTrace(fmt.Errorf("lstat: %w", err), directory)
+	}
+	if !info.IsDir() {
+		return altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: cache directory is not a directory", altshiftErrors.ErrVerificationError),
+			directory, info.Mode().String(),
+		)
+	}
+
+	if !ownedByCurrentUser(info) {
+		return altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: cache directory belongs to another user", altshiftErrors.ErrVerificationError),
+			directory, os.Getuid(),
+		)
+	}
+	if mode := info.Mode().Perm(); mode != 0o700 {
+		return altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: cache directory mode is %#o, want 0700", altshiftErrors.ErrVerificationError, mode),
+			directory,
+		)
+	}
+
+	return nil
+}
+
+// ownedByCurrentUser reports whether the file belongs to this process's real uid. Both sides are
+// widened to int64, which holds a uint32 uid and an int alike.
+func ownedByCurrentUser(info fs.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat == nil {
+		return false
+	}
+
+	return int64(stat.Uid) == int64(os.Getuid())
+}
+
+// readCacheFile reads a cache file without following a link, and yields nil data for anything
+// that is not a regular file of this user's, closed to everyone else: such a file is not used,
+// and the next StoreToken replaces it.
+func readCacheFile(path string) ([]byte, error) {
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0) //nolint:gosec // The path is CachePath's.
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ELOOP) {
+			return nil, nil
+		}
+		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("open: %w", err), path)
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("stat: %w", err), path)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || !ownedByCurrentUser(info) {
+		return nil, nil
+	}
+
+	data, err := io.ReadAll(io.LimitReader(file, maxCacheFileSize))
+	if err != nil {
+		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("read: %w", err), path)
+	}
+
+	return data, nil
 }

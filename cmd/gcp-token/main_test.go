@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"errors"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -188,11 +190,11 @@ func TestTokenFor(t *testing.T) {
 			t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 			mint, calls := countingMinter()
 
-			first, err := tokenFor(testCase.first, testCase.firstKey, mint)
+			first, err := tokenFor(testCase.first, testCase.firstKey, mint, io.Discard)
 			if err != nil {
 				t.Fatalf("first: %v", err)
 			}
-			second, err := tokenFor(testCase.second, testCase.secondKey, mint)
+			second, err := tokenFor(testCase.second, testCase.secondKey, mint, io.Discard)
 			if err != nil {
 				t.Fatalf("second: %v", err)
 			}
@@ -247,8 +249,95 @@ func TestTokenForErrors(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) { //nolint:paralleltest // t.Setenv, as above.
 			t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 
-			if _, err := tokenFor(testCase.cfg, testCase.key, testCase.mint); err == nil {
+			if _, err := tokenFor(testCase.cfg, testCase.key, testCase.mint, io.Discard); err == nil {
 				t.Error("expected an error, got none")
+			}
+		})
+	}
+}
+
+// TestTokenForCacheFailures covers a cache that cannot be written, which must not cost the token
+// just minted, and a cache directory that is not the user's alone, which is refused before
+// anything is minted.
+//
+//nolint:paralleltest // t.Setenv mutates process state and cannot run alongside other tests.
+func TestTokenForCacheFailures(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root writes through the read-only directory this relies on")
+	}
+
+	key := testKey(t)
+
+	testCases := []struct {
+		name        string
+		prepare     func(t *testing.T, runtimeDir string)
+		expectErr   bool
+		wantMints   int
+		wantWarning bool
+	}{
+		{
+			name: "a token that cannot be cached is still returned, with a warning",
+			prepare: func(t *testing.T, runtimeDir string) {
+				t.Helper()
+				if err := os.Chmod(runtimeDir, 0o500); err != nil {
+					t.Fatalf("chmod: %v", err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(runtimeDir, 0o700) })
+			},
+			wantMints:   1,
+			wantWarning: true,
+		},
+		{
+			name: "a cache directory open to others is refused before minting",
+			prepare: func(t *testing.T, runtimeDir string) {
+				t.Helper()
+				if err := os.Mkdir(filepath.Join(runtimeDir, "tpm-signer"), 0o755); err != nil {
+					t.Fatalf("mkdir: %v", err)
+				}
+				if err := os.Chmod(filepath.Join(runtimeDir, "tpm-signer"), 0o755); err != nil {
+					t.Fatalf("chmod: %v", err)
+				}
+			},
+			expectErr: true,
+		},
+		{
+			name:      "a fresh cache directory is made, and nothing is said",
+			prepare:   func(*testing.T, string) {},
+			wantMints: 1,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) { //nolint:paralleltest // t.Setenv, as above.
+			runtimeDir := t.TempDir()
+			t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+			testCase.prepare(t, runtimeDir)
+
+			mint, calls := countingMinter()
+			var warnings bytes.Buffer
+			token, err := tokenFor(
+				&config{serviceAccount: testServiceAccount, scopes: []string{gcp.ScopeCloudPlatform}},
+				key,
+				mint,
+				&warnings,
+			)
+			if *calls != testCase.wantMints {
+				t.Errorf("minted %d times, want %d", *calls, testCase.wantMints)
+			}
+			if testCase.expectErr {
+				if err == nil {
+					t.Fatal("expected an error, got none")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if token == nil || token.AccessToken == "" {
+				t.Fatal("no token")
+			}
+			if got := warnings.Len() != 0; got != testCase.wantWarning {
+				t.Errorf("warned = %v (%q), want %v", got, warnings.String(), testCase.wantWarning)
 			}
 		})
 	}

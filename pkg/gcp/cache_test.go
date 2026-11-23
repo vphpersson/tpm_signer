@@ -5,11 +5,17 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
 	"time"
+
+	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
 )
 
 const (
@@ -317,6 +323,309 @@ func TestLoadTokenMissingOrCorrupt(t *testing.T) {
 			}
 			if token != nil {
 				t.Errorf("expected no token, got %+v", token)
+			}
+		})
+	}
+}
+
+// TestCacheDirectory holds the cache directory to being the user's alone, on the way in and the
+// way out.
+func TestCacheDirectory(t *testing.T) {
+	t.Parallel()
+
+	key := testCacheKey(t, []string{ScopeCloudPlatform}, testPublicKey(t))
+	token := &Token{AccessToken: "ya29.x", Expiry: time.Now().Add(time.Hour)}
+
+	testCases := []struct {
+		name string
+		// prepare lays out the runtime directory and returns the cache directory to use.
+		prepare        func(t *testing.T, runtimeDir string) string
+		expectStoreErr bool
+		expectLoadErr  bool
+	}{
+		{
+			name:    "a missing directory is made, mode 0700",
+			prepare: func(_ *testing.T, runtimeDir string) string { return filepath.Join(runtimeDir, "tpm-signer") },
+		},
+		{
+			name: "an existing directory of the user's, mode 0700",
+			prepare: func(t *testing.T, runtimeDir string) string {
+				t.Helper()
+				return mkdir(t, filepath.Join(runtimeDir, "tpm-signer"), 0o700)
+			},
+		},
+		{
+			name: "a directory others can read is refused",
+			prepare: func(t *testing.T, runtimeDir string) string {
+				t.Helper()
+				return mkdir(t, filepath.Join(runtimeDir, "tpm-signer"), 0o755)
+			},
+			expectStoreErr: true,
+			expectLoadErr:  true,
+		},
+		{
+			name: "a directory the group can write is refused",
+			prepare: func(t *testing.T, runtimeDir string) string {
+				t.Helper()
+				return mkdir(t, filepath.Join(runtimeDir, "tpm-signer"), 0o770)
+			},
+			expectStoreErr: true,
+			expectLoadErr:  true,
+		},
+		{
+			name: "a link to a directory of the user's is refused",
+			prepare: func(t *testing.T, runtimeDir string) string {
+				t.Helper()
+				target := mkdir(t, filepath.Join(runtimeDir, "elsewhere"), 0o700)
+				link := filepath.Join(runtimeDir, "tpm-signer")
+				if err := os.Symlink(target, link); err != nil {
+					t.Fatalf("symlink: %v", err)
+				}
+				return link
+			},
+			expectStoreErr: true,
+			expectLoadErr:  true,
+		},
+		{
+			name: "a file in the directory's place is refused",
+			prepare: func(t *testing.T, runtimeDir string) string {
+				t.Helper()
+				path := filepath.Join(runtimeDir, "tpm-signer")
+				if err := os.WriteFile(path, nil, 0o600); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				return path
+			},
+			expectStoreErr: true,
+			expectLoadErr:  true,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			directory := testCase.prepare(t, t.TempDir())
+			path := filepath.Join(directory, "token.json")
+
+			err := StoreToken(path, key, token)
+			if testCase.expectStoreErr {
+				if err == nil {
+					t.Error("store: expected an error, got none")
+				} else if !errors.Is(err, altshiftErrors.ErrVerificationError) {
+					t.Errorf("store: error %v is not a verification error", err)
+				}
+			} else if err != nil {
+				t.Fatalf("store: unexpected error: %v", err)
+			}
+
+			loaded, err := LoadToken(path, key)
+			if testCase.expectLoadErr {
+				if err == nil {
+					t.Error("load: expected an error, got none")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("load: unexpected error: %v", err)
+			}
+			if loaded == nil || loaded.AccessToken != token.AccessToken {
+				t.Errorf("loaded %+v, want the stored token", loaded)
+			}
+
+			info, err := os.Lstat(directory)
+			if err != nil {
+				t.Fatalf("lstat: %v", err)
+			}
+			if mode := info.Mode().Perm(); !info.IsDir() || mode != 0o700 {
+				t.Errorf("cache directory mode = %v, want a directory with mode 0700", info.Mode())
+			}
+		})
+	}
+}
+
+func mkdir(t *testing.T, path string, mode os.FileMode) string {
+	t.Helper()
+
+	if err := os.Mkdir(path, mode); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Mkdir's mode passes through the umask.
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	return path
+}
+
+// TestCacheFileIsNotFollowed covers what might be lying in the cache directory under the names
+// the cache uses: a link at the cache file is neither read nor written through, a link at the
+// temporary name an older gcp-token used is never written through, and a cache file others can
+// read is not used.
+func TestCacheFileIsNotFollowed(t *testing.T) {
+	t.Parallel()
+
+	key := testCacheKey(t, []string{ScopeCloudPlatform}, testPublicKey(t))
+	token := &Token{AccessToken: "ya29.fresh", Expiry: time.Now().Add(time.Hour)}
+
+	// planted is a valid cache file somewhere else, holding someone else's token.
+	planted := func(t *testing.T, path string, mode os.FileMode) {
+		t.Helper()
+		if err := StoreToken(path, key, &Token{AccessToken: "ya29.planted", Expiry: time.Now().Add(time.Hour)}); err != nil {
+			t.Fatalf("store planted token: %v", err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+	}
+
+	testCases := []struct {
+		name    string
+		prepare func(t *testing.T, path string, victim string)
+	}{
+		{
+			name: "a link at the cache file",
+			prepare: func(t *testing.T, path string, victim string) {
+				t.Helper()
+				planted(t, victim, 0o600)
+				if err := os.Symlink(victim, path); err != nil {
+					t.Fatalf("symlink: %v", err)
+				}
+			},
+		},
+		{
+			name: "a link at the old fixed temporary name",
+			prepare: func(t *testing.T, path string, victim string) {
+				t.Helper()
+				planted(t, victim, 0o600)
+				if err := os.Symlink(victim, path+".tmp"); err != nil {
+					t.Fatalf("symlink: %v", err)
+				}
+			},
+		},
+		{
+			name: "a cache file others can read",
+			prepare: func(t *testing.T, path string, _ string) {
+				t.Helper()
+				planted(t, path, 0o644)
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			directory := mkdir(t, filepath.Join(t.TempDir(), "tpm-signer"), 0o700)
+			victimDirectory := mkdir(t, filepath.Join(t.TempDir(), "victim"), 0o700)
+			path := filepath.Join(directory, "token.json")
+			victim := filepath.Join(victimDirectory, "victim.json")
+			testCase.prepare(t, path, victim)
+
+			before, _ := os.ReadFile(victim)
+
+			loaded, err := LoadToken(path, key)
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if loaded != nil {
+				t.Errorf("loaded %q from a file that should not have been used", loaded.AccessToken)
+			}
+
+			if err := StoreToken(path, key, token); err != nil {
+				t.Fatalf("store: %v", err)
+			}
+
+			after, _ := os.ReadFile(victim)
+			if string(before) != string(after) {
+				t.Error("storing wrote through a link to a file outside the cache")
+			}
+
+			loaded, err = LoadToken(path, key)
+			if err != nil {
+				t.Fatalf("load after store: %v", err)
+			}
+			if loaded == nil || loaded.AccessToken != token.AccessToken {
+				t.Errorf("after storing, loaded %+v, want the fresh token", loaded)
+			}
+		})
+	}
+}
+
+// TestStoreTokenConcurrently is two cold mints finishing at once, many times over: every store
+// must succeed, since a failure there is a PIN typed for nothing, and the file left behind must
+// be one of them, whole.
+func TestStoreTokenConcurrently(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name    string
+		writers int
+		rounds  int
+	}{
+		{name: "two writers", writers: 2, rounds: 200},
+		{name: "many writers", writers: 16, rounds: 20},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			key := testCacheKey(t, []string{ScopeCloudPlatform}, testPublicKey(t))
+
+			for round := range testCase.rounds {
+				path := filepath.Join(t.TempDir(), "tpm-signer", "token.json")
+
+				var waitGroup sync.WaitGroup
+				failures := make(chan error, testCase.writers)
+				for writer := range testCase.writers {
+					waitGroup.Go(func() {
+						token := &Token{AccessToken: fmt.Sprintf("ya29.writer-%d", writer), Expiry: time.Now().Add(time.Hour)}
+						if err := StoreToken(path, key, token); err != nil {
+							failures <- err
+						}
+					})
+				}
+				waitGroup.Wait()
+				close(failures)
+
+				for err := range failures {
+					t.Fatalf("round %d: a concurrent store failed: %v", round, err)
+				}
+
+				loaded, err := LoadToken(path, key)
+				if err != nil || loaded == nil {
+					t.Fatalf("round %d: load = %+v, %v", round, loaded, err)
+				}
+
+				leftovers, err := filepath.Glob(filepath.Join(filepath.Dir(path), "*.tmp"))
+				if err != nil {
+					t.Fatalf("glob: %v", err)
+				}
+				if len(leftovers) != 0 {
+					t.Fatalf("round %d: temporary files left behind: %v", round, leftovers)
+				}
+			}
+		})
+	}
+}
+
+func TestCheckCacheDirectoryMissing(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		path string
+	}{
+		{name: "a directory that is not there wraps fs.ErrNotExist", path: filepath.Join(t.TempDir(), "absent")},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			if err := checkCacheDirectory(testCase.path); !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("error = %v, want one wrapping fs.ErrNotExist", err)
 			}
 		})
 	}

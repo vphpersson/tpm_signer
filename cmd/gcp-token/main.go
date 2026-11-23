@@ -68,8 +68,9 @@ type minter func() (*gcp.Token, error)
 
 // tokenFor returns a token for cfg: the cached one when it was minted for the same service
 // account, scopes and key and has life left in it, and otherwise one from mint, which is then
-// cached.
-func tokenFor(cfg *config, key *keyfile.Key, mint minter) (*gcp.Token, error) {
+// cached. A token that cannot be cached is still returned, with a warning on warnings: by then
+// the PIN has been typed and the TPM has signed, and failing would waste both.
+func tokenFor(cfg *config, key *keyfile.Key, mint minter, warnings io.Writer) (*gcp.Token, error) {
 	if mint == nil {
 		return nil, nil_error.New("mint")
 	}
@@ -110,8 +111,8 @@ func tokenFor(cfg *config, key *keyfile.Key, mint minter) (*gcp.Token, error) {
 	}
 
 	if cachePath != "" {
-		if err := gcp.StoreToken(cachePath, cacheKey, token); err != nil {
-			return nil, fmt.Errorf("store token: %w", err)
+		if err := gcp.StoreToken(cachePath, cacheKey, token); err != nil && warnings != nil {
+			_, _ = fmt.Fprintf(warnings, "gcp-token: warning: the token was not cached: %v\n", err)
 		}
 	}
 
@@ -164,7 +165,7 @@ func run() error {
 		return token, nil
 	}
 
-	token, err := tokenFor(cfg, key, mint)
+	token, err := tokenFor(cfg, key, mint, os.Stderr)
 	if err != nil {
 		return fmt.Errorf("token for: %w", err)
 	}
