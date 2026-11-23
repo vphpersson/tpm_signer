@@ -108,7 +108,7 @@ Because a key with a PIN is created with `NoDA` false, it sits under the TPM's d
 | one failure forgiven every | 10 minutes | 2 hours |
 | lockout recovery | 24 hours | 24 hours |
 
-That is roughly 144 guesses per day on capa after the initial allowance, which is what makes a six-digit PIN defensible here in a way a six-character password would not be anywhere else. Read the values for a given chip with `GetCapability` on `TPM_PT_MAX_AUTH_FAIL` and its neighbours rather than assuming these.
+That is roughly 144 guesses per day on capa after the initial allowance, which is what makes a six-digit PIN defensible here in a way a six-character password would not be anywhere else. Read the values for a given chip with `GetCapability` on `TPM_PT_MAX_AUTH_FAIL` and its neighbours rather than assuming these. A new key's PIN must be at least six characters, and at most 32 bytes, the longest auth value a SHA-256 key can have; keys created before that rule keep the PIN they have.
 
 A key made with `--no-pin` is created with `NoDA` set instead. With no auth value there is nothing to guess, so the lockout would protect nothing, and it would let failed PINs against other keys on the same chip lock an unattended job out for a day.
 

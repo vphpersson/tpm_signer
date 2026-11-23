@@ -53,6 +53,35 @@ const DefaultKeyType = KeyTypeRSA2048
 // p256CoordinateSize is the byte length of a P-256 field element.
 const p256CoordinateSize = 32
 
+const (
+	// MinimumPINLength is the shortest PIN a new key is given, in bytes. What makes a short PIN
+	// defensible is the dictionary attack lockout, which on capa allows 31 guesses and then about
+	// 144 a day: six digits take years to exhaust at that rate, four take weeks, and one is inside
+	// the first allowance. Only new keys are held to it; a key made before keeps its PIN.
+	MinimumPINLength = 6
+	// MaximumPINLength is the longest auth value a key with a SHA-256 name can have: the TPM
+	// refuses one longer than the name algorithm's digest.
+	MaximumPINLength = sha256.Size
+)
+
+// ValidateNewPIN refuses a PIN too short for a new key, or too long for the TPM to take.
+func ValidateNewPIN(pin []byte) error {
+	if len(pin) < MinimumPINLength {
+		return altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: a new PIN must be at least %d characters", altshiftErrors.ErrValidationError, MinimumPINLength),
+			len(pin),
+		)
+	}
+	if len(pin) > MaximumPINLength {
+		return altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: a PIN can be at most %d bytes", altshiftErrors.ErrValidationError, MaximumPINLength),
+			len(pin),
+		)
+	}
+
+	return nil
+}
+
 // KeyTemplate describes the leaf key: signing only, non-duplicable, with a null scheme so that the
 // signature scheme is chosen at sign time.
 //
@@ -494,10 +523,16 @@ func (signer *Signer) authValue() ([]byte, error) {
 
 // CreateKey generates a signing key inside the TPM. The private half is produced by the chip and
 // never exists outside it; what comes back is only the wrapped blob for the key file. An empty pin
-// makes a key that anything able to reach the TPM can sign with.
+// makes a key that anything able to reach the TPM can sign with; any other is held to
+// ValidateNewPIN before the TPM is opened.
 func CreateKey(devicePath string, keyType KeyType, pin []byte, description string) (*keyfile.Key, error) {
 	if devicePath == "" {
 		return nil, empty_error.New("device path")
+	}
+	if len(pin) != 0 {
+		if err := ValidateNewPIN(pin); err != nil {
+			return nil, fmt.Errorf("validate new pin: %w", err)
+		}
 	}
 
 	template, err := KeyTemplate(keyType, len(pin) == 0)

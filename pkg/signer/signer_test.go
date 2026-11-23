@@ -13,9 +13,11 @@ import (
 	"errors"
 	"math/big"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
 	"github.com/google/go-tpm/tpm2"
 
 	"github.com/vphpersson/tpm_signer/pkg/keyfile"
@@ -730,6 +732,69 @@ func TestAuthValue(t *testing.T) {
 
 			if !bytes.Equal(pin, testCase.pin) {
 				t.Errorf("the provider's pin is now %q, want it untouched as %q", pin, testCase.pin)
+			}
+		})
+	}
+}
+
+func TestValidateNewPIN(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name      string
+		pin       []byte
+		expectErr bool
+	}{
+		{name: "six digits", pin: []byte("482913")},
+		{name: "a passphrase", pin: []byte("correct horse battery staple")},
+		{name: "as long as a sha-256 digest", pin: bytes.Repeat([]byte("a"), 32)},
+		{name: "five digits", pin: []byte("48291"), expectErr: true},
+		{name: "one digit", pin: []byte("4"), expectErr: true},
+		{name: "empty", pin: nil, expectErr: true},
+		{name: "longer than the tpm takes", pin: bytes.Repeat([]byte("a"), 33), expectErr: true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := ValidateNewPIN(testCase.pin)
+			if (err != nil) != testCase.expectErr {
+				t.Fatalf("error = %v, want an error: %v", err, testCase.expectErr)
+			}
+			if err != nil && !errors.Is(err, altshiftErrors.ErrValidationError) {
+				t.Errorf("error %v is not a validation error", err)
+			}
+		})
+	}
+}
+
+// TestCreateKeyRefusesShortPIN points CreateKey at a device that is not there, so that a PIN it
+// lets through fails at the open, and one it refuses fails before.
+func TestCreateKeyRefusesShortPIN(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name           string
+		pin            []byte
+		wantValidation bool
+	}{
+		{name: "a short pin is refused before the tpm is opened", pin: []byte("1234"), wantValidation: true},
+		{name: "a long enough pin reaches the device", pin: []byte("482913")},
+		{name: "no pin reaches the device", pin: nil},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			absent := filepath.Join(t.TempDir(), "tpmrm0")
+			_, err := CreateKey(absent, KeyTypeECCP256, testCase.pin, "test")
+			if err == nil {
+				t.Fatal("expected an error, got none")
+			}
+			if got := errors.Is(err, altshiftErrors.ErrValidationError); got != testCase.wantValidation {
+				t.Errorf("error %v: validation = %v, want %v", err, got, testCase.wantValidation)
 			}
 		})
 	}
