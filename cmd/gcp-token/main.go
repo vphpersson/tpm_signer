@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -38,14 +39,30 @@ type config struct {
 	scopes         []string
 	devicePath     string
 	noCache        bool
+	cachedOnly     bool
 	exportForm     bool
 }
 
+// errNoCachedToken reports that --cached-only found nothing it could print.
+var errNoCachedToken = errors.New("no cached token is valid for this request")
+
 // newParser declares the command line, bound to cfg.
 func newParser(cfg *config) *argument_parser.Parser {
+	noCacheOption := option.NewBoolOption(0, "no-cache", "ignore and do not write the token cache", false, &cfg.noCache)
+	cachedOnlyOption := option.NewBoolOption(
+		0,
+		"cached-only",
+		"print a cached token if one is valid, and fail rather than ask for the PIN and mint one",
+		false,
+		&cfg.cachedOnly,
+	)
+
 	return &argument_parser.Parser{
 		Description: "Mint a Google Cloud access token with a TPM-held key.",
 		ProgramName: "gcp-token",
+		ExclusiveGroups: []*argument_parser.ExclusiveGroup{
+			{Options: []option.Option{noCacheOption, cachedOnlyOption}},
+		},
 		Options: []option.Option{
 			option.WithDefault(
 				option.NewStringOption('f', "key-file", "TPM key file", false, &cfg.keyPath),
@@ -57,7 +74,8 @@ func newParser(cfg *config) *argument_parser.Parser {
 				option.NewStringOption('D', "device", "TPM device path", false, &cfg.devicePath),
 				signer.DefaultDevicePath,
 			),
-			option.NewBoolOption(0, "no-cache", "ignore and do not write the token cache", false, &cfg.noCache),
+			noCacheOption,
+			cachedOnlyOption,
 			option.NewBoolOption('e', "export", "print a shell export statement instead of the bare token", false, &cfg.exportForm),
 		},
 	}
@@ -100,6 +118,11 @@ func tokenFor(cfg *config, key *keyfile.Key, mint minter, warnings io.Writer) (*
 		if cached != nil && cached.Valid(refreshMargin) {
 			return cached, nil
 		}
+	}
+	// What a caller with no terminal asks for: it could not answer the PIN prompt, so it learns at
+	// once that it would have been shown one, rather than after the prompt times out.
+	if cfg.cachedOnly {
+		return nil, errNoCachedToken
 	}
 
 	token, err := mint()

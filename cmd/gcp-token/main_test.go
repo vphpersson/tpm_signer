@@ -342,3 +342,136 @@ func TestTokenForCacheFailures(t *testing.T) {
 		})
 	}
 }
+
+// cachedToken is a token left in the cache by an earlier run, with lifetime left in it.
+func cachedToken(lifetime time.Duration) *gcp.Token {
+	return &gcp.Token{AccessToken: "ya29.cached", Expiry: time.Now().Add(lifetime)} //nolint:gosec // G101: a test fixture, not a credential.
+}
+
+//nolint:paralleltest // t.Setenv mutates process state and cannot run alongside other tests.
+func TestTokenForCachedOnly(t *testing.T) {
+	key := testKey(t)
+	broad := []string{gcp.ScopeCloudPlatform}
+
+	testCases := []struct {
+		name string
+		// cached is what a run with a terminal left in the cache beforehand, if anything.
+		cached    *gcp.Token
+		scopes    []string
+		expectErr bool
+	}{
+		{name: "nothing cached", scopes: broad, expectErr: true},
+		{
+			name:   "a valid token is printed",
+			cached: cachedToken(time.Hour),
+			scopes: broad,
+		},
+		{
+			name:      "a token about to expire is not",
+			cached:    cachedToken(time.Minute),
+			scopes:    broad,
+			expectErr: true,
+		},
+		{
+			name:      "a token for other scopes is not",
+			cached:    cachedToken(time.Hour),
+			scopes:    []string{testReadOnlyScope},
+			expectErr: true,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) { //nolint:paralleltest // t.Setenv, as above.
+			t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+
+			if testCase.cached != nil {
+				seed := func() (*gcp.Token, error) { return testCase.cached, nil }
+				if _, err := tokenFor(&config{serviceAccount: testServiceAccount, scopes: broad}, key, seed, io.Discard); err != nil {
+					t.Fatalf("seed the cache: %v", err)
+				}
+			}
+
+			mint, calls := countingMinter()
+			token, err := tokenFor(
+				&config{serviceAccount: testServiceAccount, scopes: testCase.scopes, cachedOnly: true},
+				key,
+				mint,
+				io.Discard,
+			)
+			if *calls != 0 {
+				t.Errorf("minted %d times, want none: --cached-only must never ask for the PIN", *calls)
+			}
+			if testCase.expectErr {
+				if !errors.Is(err, errNoCachedToken) {
+					t.Errorf("error = %v, want errNoCachedToken", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if token.AccessToken != testCase.cached.AccessToken {
+				t.Errorf("token = %q, want the cached %q", token.AccessToken, testCase.cached.AccessToken)
+			}
+		})
+	}
+}
+
+func TestParseArguments(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name           string
+		arguments      []string
+		expectErr      bool
+		wantCachedOnly bool
+		wantNoCache    bool
+		wantScopes     []string
+	}{
+		{name: "a service account alone", arguments: []string{"-a", testServiceAccount}},
+		{name: "cached only", arguments: []string{"-a", testServiceAccount, "--cached-only"}, wantCachedOnly: true},
+		{name: "no cache", arguments: []string{"-a", testServiceAccount, "--no-cache"}, wantNoCache: true},
+		{
+			name:       "repeated scopes",
+			arguments:  []string{"-a", testServiceAccount, "-s", gcp.ScopeCloudPlatform, "-s", testReadOnlyScope},
+			wantScopes: []string{gcp.ScopeCloudPlatform, testReadOnlyScope},
+		},
+		{name: "cached only and no cache rule each other out", arguments: []string{"-a", testServiceAccount, "--cached-only", "--no-cache"}, expectErr: true},
+		{name: "no service account", arguments: []string{"--cached-only"}, expectErr: true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := &config{}
+			parser := newParser(cfg)
+			if err := parser.Validate(); err != nil {
+				t.Fatalf("validate: %v", err)
+			}
+
+			err := parser.ParseArgs(testCase.arguments)
+			if testCase.expectErr {
+				if err == nil {
+					t.Fatal("expected an error, got none")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.cachedOnly != testCase.wantCachedOnly {
+				t.Errorf("cached only = %v, want %v", cfg.cachedOnly, testCase.wantCachedOnly)
+			}
+			if cfg.noCache != testCase.wantNoCache {
+				t.Errorf("no cache = %v, want %v", cfg.noCache, testCase.wantNoCache)
+			}
+			if len(cfg.scopes) != len(testCase.wantScopes) {
+				t.Errorf("scopes = %v, want %v", cfg.scopes, testCase.wantScopes)
+			}
+			if cfg.serviceAccount != testServiceAccount {
+				t.Errorf("service account = %q, want %q", cfg.serviceAccount, testServiceAccount)
+			}
+		})
+	}
+}

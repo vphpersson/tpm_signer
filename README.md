@@ -74,6 +74,8 @@ terraform plan
 
 `gcloud` reads the same token from `CLOUDSDK_AUTH_ACCESS_TOKEN`. Tokens are cached under `XDG_RUNTIME_DIR`, which is tmpfs, so the PIN is asked for roughly once an hour rather than once per command, and nothing survives a reboot. A cached token is reused only for the service account, set of scopes and key it was minted for: the file is named after all three, records them, and is checked against them when it is read, so a request for a narrow scope never gets a `cloud-platform` token, nor the other way round. The cache directory must be a directory of your own with mode 0700, or nothing is read from it or written to it; a cache file that is a link, or open to anyone else, is ignored and replaced. A token that cannot be cached is still printed, with a warning, since by then the PIN has been typed.
 
+A caller with no terminal cannot answer the PIN prompt. `gcp-token --cached-only` prints a cached token if one is valid for the request, and otherwise fails at once, without asking for the PIN or opening the TPM; a script uses it to find out whether it can proceed, rather than working out the cache file's name itself.
+
 ## In a long-running program
 
 `gcp-token` suits a command line: mint a token, run one thing, exit. A daemon needs more, because a token lasts an hour and one handed to it at startup stops working an hour later. The usual answer is to give the process a service account key file instead -- which is the bearer credential this exists to remove.
