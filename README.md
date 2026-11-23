@@ -72,7 +72,7 @@ export GOOGLE_OAUTH_ACCESS_TOKEN="$(gcp-token -a SERVICE_ACCOUNT)"
 terraform plan
 ```
 
-`gcloud` reads the same token from `CLOUDSDK_AUTH_ACCESS_TOKEN`. Tokens are cached under `XDG_RUNTIME_DIR`, which is tmpfs, so the PIN is asked for roughly once an hour rather than once per command, and nothing survives a reboot.
+`gcloud` reads the same token from `CLOUDSDK_AUTH_ACCESS_TOKEN`. Tokens are cached under `XDG_RUNTIME_DIR`, which is tmpfs, so the PIN is asked for roughly once an hour rather than once per command, and nothing survives a reboot. A cached token is reused only for the service account, set of scopes and key it was minted for: the file is named after all three, records them, and is checked against them when it is read, so a request for a narrow scope never gets a `cloud-platform` token, nor the other way round.
 
 ## In a long-running program
 

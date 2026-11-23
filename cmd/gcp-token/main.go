@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/altshiftab/utils_go/pkg/cli/argument_parser"
 	"github.com/altshiftab/utils_go/pkg/cli/argument_parser/option"
+	"github.com/altshiftab/utils_go/pkg/errors/types/nil_error"
 
 	"github.com/vphpersson/tpm_signer/pkg/gcp"
 	"github.com/vphpersson/tpm_signer/pkg/keyfile"
@@ -29,60 +31,106 @@ import (
 // not expire in the middle of a long apply.
 const refreshMargin = 5 * time.Minute
 
-func run() error {
-	var keyPath string
-	var serviceAccount string
-	var scopes []string
-	var devicePath string
-	var noCache bool
-	var exportForm bool
+// config is what the command line asks for.
+type config struct {
+	keyPath        string
+	serviceAccount string
+	scopes         []string
+	devicePath     string
+	noCache        bool
+	exportForm     bool
+}
 
-	parser := &argument_parser.Parser{
+// newParser declares the command line, bound to cfg.
+func newParser(cfg *config) *argument_parser.Parser {
+	return &argument_parser.Parser{
 		Description: "Mint a Google Cloud access token with a TPM-held key.",
 		ProgramName: "gcp-token",
 		Options: []option.Option{
 			option.WithDefault(
-				option.NewStringOption('f', "key-file", "TPM key file", false, &keyPath),
+				option.NewStringOption('f', "key-file", "TPM key file", false, &cfg.keyPath),
 				defaultKeyPath(),
 			),
-			option.NewStringOption('a', "service-account", "service account email to authenticate as", true, &serviceAccount),
-			option.NewStringsOption('s', "scope", "OAuth scope, repeatable", false, &scopes),
+			option.NewStringOption('a', "service-account", "service account email to authenticate as", true, &cfg.serviceAccount),
+			option.NewStringsOption('s', "scope", "OAuth scope, repeatable", false, &cfg.scopes),
 			option.WithDefault(
-				option.NewStringOption('D', "device", "TPM device path", false, &devicePath),
+				option.NewStringOption('D', "device", "TPM device path", false, &cfg.devicePath),
 				signer.DefaultDevicePath,
 			),
-			option.NewBoolOption(0, "no-cache", "ignore and do not write the token cache", false, &noCache),
-			option.NewBoolOption('e', "export", "print a shell export statement instead of the bare token", false, &exportForm),
+			option.NewBoolOption(0, "no-cache", "ignore and do not write the token cache", false, &cfg.noCache),
+			option.NewBoolOption('e', "export", "print a shell export statement instead of the bare token", false, &cfg.exportForm),
 		},
 	}
+}
+
+// minter mints a fresh token; it is where the PIN is asked for and the TPM is put to work.
+type minter func() (*gcp.Token, error)
+
+// tokenFor returns a token for cfg: the cached one when it was minted for the same service
+// account, scopes and key and has life left in it, and otherwise one from mint, which is then
+// cached.
+func tokenFor(cfg *config, key *keyfile.Key, mint minter) (*gcp.Token, error) {
+	if mint == nil {
+		return nil, nil_error.New("mint")
+	}
+
+	cachePath := ""
+	var cacheKey *gcp.CacheKey
+	if !cfg.noCache {
+		publicKey, err := signer.PublicKey(key)
+		if err != nil {
+			return nil, fmt.Errorf("public key: %w", err)
+		}
+
+		cacheKey, err = gcp.NewCacheKey(cfg.serviceAccount, cfg.scopes, publicKey)
+		if err != nil {
+			return nil, fmt.Errorf("new cache key: %w", err)
+		}
+
+		cachePath, err = gcp.CachePath(cacheKey)
+		if err != nil {
+			return nil, fmt.Errorf("cache path: %w", err)
+		}
+
+		cached, err := gcp.LoadToken(cachePath, cacheKey)
+		if err != nil {
+			return nil, fmt.Errorf("load cached token: %w", err)
+		}
+		if cached != nil && cached.Valid(refreshMargin) {
+			return cached, nil
+		}
+	}
+
+	token, err := mint()
+	if err != nil {
+		return nil, fmt.Errorf("mint token: %w", err)
+	}
+	if token == nil {
+		return nil, nil_error.New("token")
+	}
+
+	if cachePath != "" {
+		if err := gcp.StoreToken(cachePath, cacheKey, token); err != nil {
+			return nil, fmt.Errorf("store token: %w", err)
+		}
+	}
+
+	return token, nil
+}
+
+func run() error {
+	cfg := &config{}
+	parser := newParser(cfg)
 	if err := parser.Validate(); err != nil {
 		return fmt.Errorf("parser validate: %w", err)
 	}
 	parser.ParseOrExit()
 
-	if len(scopes) == 0 {
-		scopes = []string{gcp.ScopeCloudPlatform}
+	if len(cfg.scopes) == 0 {
+		cfg.scopes = []string{gcp.ScopeCloudPlatform}
 	}
 
-	cachePath := ""
-	if !noCache {
-		var err error
-		cachePath, err = gcp.CachePath(serviceAccount)
-		if err != nil {
-			return fmt.Errorf("cache path: %w", err)
-		}
-
-		cached, err := gcp.LoadToken(cachePath)
-		if err != nil {
-			return fmt.Errorf("load cached token: %w", err)
-		}
-		if cached != nil && cached.Valid(refreshMargin) {
-			emit(cached.AccessToken, exportForm)
-			return nil
-		}
-	}
-
-	keyData, err := os.ReadFile(keyPath)
+	keyData, err := os.ReadFile(cfg.keyPath)
 	if err != nil {
 		return fmt.Errorf("read key file: %w", err)
 	}
@@ -95,41 +143,44 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var pinProvider signer.PINProvider
-	if !key.EmptyAuth {
-		pinProvider = func() ([]byte, error) {
-			return pin.Prompt(ctx, fmt.Sprintf("TPM PIN for %s: ", serviceAccount), pin.DefaultTimeout)
+	mint := func() (*gcp.Token, error) {
+		var pinProvider signer.PINProvider
+		if !key.EmptyAuth {
+			pinProvider = func() ([]byte, error) {
+				return pin.Prompt(ctx, fmt.Sprintf("TPM PIN for %s: ", cfg.serviceAccount), pin.DefaultTimeout)
+			}
 		}
-	}
 
-	keySigner, err := signer.New(key, devicePath, pinProvider)
-	if err != nil {
-		return fmt.Errorf("new signer: %w", err)
-	}
-
-	token, err := (&gcp.Client{}).MintToken(ctx, keySigner, serviceAccount, scopes)
-	if err != nil {
-		return fmt.Errorf("mint token: %w", err)
-	}
-
-	if cachePath != "" {
-		if err := gcp.StoreToken(cachePath, token); err != nil {
-			return fmt.Errorf("store token: %w", err)
+		keySigner, err := signer.New(key, cfg.devicePath, pinProvider)
+		if err != nil {
+			return nil, fmt.Errorf("new signer: %w", err)
 		}
+
+		token, err := (&gcp.Client{}).MintToken(ctx, keySigner, cfg.serviceAccount, cfg.scopes)
+		if err != nil {
+			return nil, fmt.Errorf("client mint token: %w", err)
+		}
+
+		return token, nil
 	}
 
-	emit(token.AccessToken, exportForm)
+	token, err := tokenFor(cfg, key, mint)
+	if err != nil {
+		return fmt.Errorf("token for: %w", err)
+	}
+
+	emit(os.Stdout, token.AccessToken, cfg.exportForm)
 
 	return nil
 }
 
-func emit(token string, exportForm bool) {
+func emit(writer io.Writer, token string, exportForm bool) {
 	if exportForm {
-		fmt.Printf("export GOOGLE_OAUTH_ACCESS_TOKEN=%s\n", token)
+		_, _ = fmt.Fprintf(writer, "export GOOGLE_OAUTH_ACCESS_TOKEN=%s\n", token)
 		return
 	}
 
-	fmt.Println(token)
+	_, _ = fmt.Fprintln(writer, token)
 }
 
 func defaultKeyPath() string {
