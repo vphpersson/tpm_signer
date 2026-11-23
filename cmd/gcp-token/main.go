@@ -94,6 +94,9 @@ type minter func() (*gcp.Token, error)
 // cached. A token that cannot be cached is still returned, with a warning on warnings: by then
 // the PIN has been typed and the TPM has signed, and failing would waste both.
 func tokenFor(cfg *config, key *keyfile.Key, mint minter, warnings io.Writer) (*gcp.Token, error) {
+	if key == nil {
+		return nil, nil_error.New("key")
+	}
 	if mint == nil {
 		return nil, nil_error.New("mint")
 	}
@@ -181,9 +184,11 @@ func run() error {
 	mint := func() (*gcp.Token, error) {
 		var pinProvider signer.PINProvider
 		if !key.EmptyAuth {
-			pinProvider = func() ([]byte, error) {
+			var scrub func()
+			pinProvider, scrub = scrubbing(func() ([]byte, error) {
 				return pin.Prompt(ctx, fmt.Sprintf("TPM PIN for %s: ", cfg.serviceAccount), pin.DefaultTimeout)
-			}
+			})
+			defer scrub()
 		}
 
 		keySigner, err := signer.New(key, cfg.devicePath, pinProvider)
@@ -228,6 +233,25 @@ func emit(writer io.Writer, token string, exportForm bool) error {
 	}
 
 	return nil
+}
+
+// scrubbing wraps a PIN provider so that every PIN it hands out can be zeroed once signing is
+// done, by the function it returns. Sign zeroes only its own copy, and leaves the provider's
+// slice to the provider.
+func scrubbing(provider signer.PINProvider) (signer.PINProvider, func()) {
+	var handedOut [][]byte
+	wrapped := func() ([]byte, error) {
+		value, err := provider()
+		handedOut = append(handedOut, value)
+		return value, err
+	}
+	scrub := func() {
+		for _, value := range handedOut {
+			clear(value)
+		}
+	}
+
+	return wrapped, scrub
 }
 
 func defaultKeyPath() string {

@@ -549,3 +549,67 @@ func TestTokenForWarnsOfAnUnrecordedParent(t *testing.T) {
 		})
 	}
 }
+
+func TestScrubbing(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name  string
+		calls int
+	}{
+		{name: "one prompt", calls: 1},
+		{name: "a prompt per signature", calls: 3},
+		{name: "never asked", calls: 0},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			provider, scrub := scrubbing(func() ([]byte, error) { return []byte("482913"), nil })
+
+			var entered [][]byte
+			for range testCase.calls {
+				value, err := provider()
+				if err != nil {
+					t.Fatalf("provider: %v", err)
+				}
+				if string(value) != "482913" {
+					t.Fatalf("pin = %q before scrubbing", value)
+				}
+				entered = append(entered, value)
+			}
+
+			scrub()
+
+			for index, value := range entered {
+				if !bytes.Equal(value, make([]byte, len(value))) {
+					t.Errorf("pin %d is %q after scrubbing", index, value)
+				}
+			}
+		})
+	}
+}
+
+func TestTokenForNilKey(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		cfg  *config
+	}{
+		{name: "no key with the cache", cfg: &config{serviceAccount: testServiceAccount, scopes: []string{gcp.ScopeCloudPlatform}}},
+		{name: "no key without it", cfg: &config{serviceAccount: testServiceAccount, scopes: []string{gcp.ScopeCloudPlatform}, noCache: true}},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			mint, _ := countingMinter()
+			if _, err := tokenFor(testCase.cfg, nil, mint, io.Discard); err == nil {
+				t.Error("expected an error, got none")
+			}
+		})
+	}
+}
