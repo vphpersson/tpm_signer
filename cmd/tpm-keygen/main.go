@@ -5,7 +5,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -164,9 +163,11 @@ func run() error {
 		return fmt.Errorf("create key: %w", err)
 	}
 
+	// Sign copies the PIN and zeroes its copy, so the one slice serves every signature, and the
+	// deferred zero above scrubs it.
 	var pinProvider signer.PINProvider
 	if !cfg.noPIN {
-		pinProvider = func() ([]byte, error) { return bytes.Clone(pinValue), nil }
+		pinProvider = func() ([]byte, error) { return pinValue, nil }
 	}
 
 	keySigner, err := signer.New(key, cfg.devicePath, pinProvider)

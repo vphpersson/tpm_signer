@@ -6,6 +6,7 @@
 package signer
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -112,9 +113,10 @@ func KeyTemplate(keyType KeyType, emptyAuth bool) (*tpm2.TPMTPublic, error) {
 }
 
 // PINProvider yields the key's auth value. It is called once per signature so that a caller may
-// prompt, cache for a while, or read from an agent, without this package caring which. The slice is
-// the signer's: it is zeroed once the signature is made, so a provider that caches must return a
-// copy each time, or the next signature is attempted with a PIN of zeros and counts as a failure.
+// prompt, cache for a while, or read from an agent, without this package caring which. The slice
+// stays the provider's: Sign copies it, and zeroes only its copy once the signature is made, so a
+// provider that caches may hand out the same slice every time. Scrubbing that slice when it is no
+// longer wanted is the provider's business.
 type PINProvider func() ([]byte, error)
 
 // Signer implements crypto.Signer against a TPM-held key.
@@ -423,14 +425,11 @@ func (signer *Signer) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (
 	}
 	defer flushContext(device, loaded.ObjectHandle)
 
-	var pin []byte
-	if signer.pinProvider != nil {
-		pin, err = signer.pinProvider()
-		if err != nil {
-			return nil, altshiftErrors.New(fmt.Errorf("pin provider: %w", err))
-		}
-		defer zero(pin)
+	pin, err := signer.authValue()
+	if err != nil {
+		return nil, altshiftErrors.New(fmt.Errorf("auth value: %w", err))
 	}
+	defer zero(pin)
 
 	// The session is salted to the primary and encrypts command parameters, so the PIN is never
 	// on the wire: it keys an HMAC instead. On a discrete TPM this is what defeats bus sniffing.
@@ -469,6 +468,28 @@ func (signer *Signer) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (
 	}
 
 	return signature, nil
+}
+
+// authValue is the PIN for one signature: a copy of what the provider returned, for Sign to zero.
+// Zeroing the provider's own slice instead would leave a provider that keeps the PIN holding
+// zeros, and the TPM drops trailing zeros from an auth value, so the next signature would be
+// attempted with an empty PIN -- a failure that counts toward the chip-wide lockout.
+func (signer *Signer) authValue() ([]byte, error) {
+	if signer.pinProvider == nil {
+		return nil, nil
+	}
+
+	provided, err := signer.pinProvider()
+	if err != nil {
+		return nil, altshiftErrors.New(fmt.Errorf("pin provider: %w", err))
+	}
+	// An empty PIN for a key that has one cannot succeed, and the failure would count toward the
+	// lockout all the same.
+	if len(provided) == 0 && !signer.key.EmptyAuth {
+		return nil, empty_error.New("pin")
+	}
+
+	return bytes.Clone(provided), nil
 }
 
 // CreateKey generates a signing key inside the TPM. The private half is produced by the chip and

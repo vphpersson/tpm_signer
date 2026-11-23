@@ -10,6 +10,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/asn1"
+	"errors"
 	"math/big"
 	"os"
 	"testing"
@@ -635,6 +636,100 @@ func TestSignRejectsUnsupportedOptions(t *testing.T) {
 
 			if _, err := testCase.signer.Sign(rand.Reader, testCase.digest, testCase.opts); err == nil {
 				t.Error("expected an error, got none")
+			}
+		})
+	}
+}
+
+// errNoTerminal stands in for a provider that cannot ask anyone.
+var errNoTerminal = errors.New("no terminal")
+
+// TestAuthValue asks for the PIN the way Sign does, twice, zeroing what it got the first time as
+// Sign does when a signature is made.
+func TestAuthValue(t *testing.T) {
+	t.Parallel()
+
+	pinKey := testKey(t)
+	emptyAuthKey := &keyfile.Key{Parent: ownerHierarchy, EmptyAuth: true, Public: pinKey.Public, Private: pinKey.Private}
+
+	testCases := []struct {
+		name      string
+		key       *keyfile.Key
+		provider  func(pin []byte) PINProvider
+		pin       []byte
+		expectErr bool
+		want      []byte
+	}{
+		{
+			name:     "a provider that caches its slice gets the same pin back the second time",
+			key:      pinKey,
+			provider: func(pin []byte) PINProvider { return func() ([]byte, error) { return pin, nil } },
+			pin:      []byte("482913"),
+			want:     []byte("482913"),
+		},
+		{
+			name:     "a provider that copies",
+			key:      pinKey,
+			provider: func(pin []byte) PINProvider { return func() ([]byte, error) { return bytes.Clone(pin), nil } },
+			pin:      []byte("482913"),
+			want:     []byte("482913"),
+		},
+		{
+			name:      "an empty pin for a key that has one is refused before the tpm sees it",
+			key:       pinKey,
+			provider:  func(pin []byte) PINProvider { return func() ([]byte, error) { return pin, nil } },
+			pin:       []byte{},
+			expectErr: true,
+		},
+		{
+			name:      "a provider that fails",
+			key:       pinKey,
+			provider:  func([]byte) PINProvider { return func() ([]byte, error) { return nil, errNoTerminal } },
+			expectErr: true,
+		},
+		{
+			name:     "no provider for a key without a pin",
+			key:      emptyAuthKey,
+			provider: func([]byte) PINProvider { return nil },
+		},
+		{
+			name:     "an empty pin for a key without one",
+			key:      emptyAuthKey,
+			provider: func(pin []byte) PINProvider { return func() ([]byte, error) { return pin, nil } },
+			pin:      []byte{},
+			want:     []byte{},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			pin := bytes.Clone(testCase.pin)
+			signer, err := New(testCase.key, DefaultDevicePath, testCase.provider(pin))
+			if err != nil {
+				t.Fatalf("new signer: %v", err)
+			}
+
+			for attempt := range 2 {
+				value, err := signer.authValue()
+				if testCase.expectErr {
+					if err == nil {
+						t.Fatal("expected an error, got none")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("attempt %d: unexpected error: %v", attempt, err)
+				}
+				if !bytes.Equal(value, testCase.want) {
+					t.Fatalf("attempt %d: pin = %q, want %q", attempt, value, testCase.want)
+				}
+				zero(value)
+			}
+
+			if !bytes.Equal(pin, testCase.pin) {
+				t.Errorf("the provider's pin is now %q, want it untouched as %q", pin, testCase.pin)
 			}
 		})
 	}
