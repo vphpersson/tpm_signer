@@ -43,11 +43,6 @@ type config struct {
 	exportForm     bool
 }
 
-// unrecordedParentWarning is what a key file from before tpm-keygen recorded the storage root key's
-// name earns: it still works, but the TPM's storage root key cannot be checked.
-const unrecordedParentWarning = "the key file records no storage root key name, so the TPM's cannot be " +
-	"checked before the PIN goes into a session salted to it; a key made by a current tpm-keygen records one"
-
 // errNoCachedToken reports that --cached-only found nothing it could print.
 var errNoCachedToken = errors.New("no cached token is valid for this request")
 
@@ -131,12 +126,6 @@ func tokenFor(cfg *config, key *keyfile.Key, mint minter, warnings io.Writer) (*
 	// once that it would have been shown one, rather than after the prompt times out.
 	if cfg.cachedOnly {
 		return nil, errNoCachedToken
-	}
-
-	// Only a key with a PIN has anything for an impostor storage root key to win, and only a mint
-	// uses it, so a cached token goes without the warning.
-	if !key.EmptyAuth && len(key.ParentName) == 0 && warnings != nil {
-		_, _ = fmt.Fprintf(warnings, "gcp-token: warning: %s\n", unrecordedParentWarning)
 	}
 
 	token, err := mint()
