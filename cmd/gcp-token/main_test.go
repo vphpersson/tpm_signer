@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -495,7 +496,7 @@ func TestParseArguments(t *testing.T) {
 			if cfg.noCache != testCase.wantNoCache {
 				t.Errorf("no cache = %v, want %v", cfg.noCache, testCase.wantNoCache)
 			}
-			if len(cfg.scopes) != len(testCase.wantScopes) {
+			if !slices.Equal(cfg.scopes, testCase.wantScopes) {
 				t.Errorf("scopes = %v, want %v", cfg.scopes, testCase.wantScopes)
 			}
 			if cfg.serviceAccount != testServiceAccount {

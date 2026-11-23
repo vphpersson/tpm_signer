@@ -752,6 +752,11 @@ func TestValidateNewPIN(t *testing.T) {
 		{name: "one digit", pin: []byte("4"), expectErr: true},
 		{name: "empty", pin: nil, expectErr: true},
 		{name: "longer than the tpm takes", pin: bytes.Repeat([]byte("a"), 33), expectErr: true},
+		{name: "six characters outside ascii", pin: []byte("åäöåäö")},
+		{name: "three characters in six bytes", pin: []byte("åäö"), expectErr: true},
+		{name: "a nul inside", pin: []byte("12\x003456"), expectErr: true},
+		{name: "a trailing nul", pin: []byte("123456\x00"), expectErr: true},
+		{name: "nuls alone", pin: make([]byte, 6), expectErr: true},
 	}
 
 	for _, testCase := range testCases {

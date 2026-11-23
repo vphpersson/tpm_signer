@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"unicode/utf8"
 
 	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
 	"github.com/altshiftab/utils_go/pkg/errors/types/empty_error"
@@ -54,7 +55,7 @@ const DefaultKeyType = KeyTypeRSA2048
 const p256CoordinateSize = 32
 
 const (
-	// MinimumPINLength is the shortest PIN a new key is given, in bytes. What makes a short PIN
+	// MinimumPINLength is the shortest PIN a new key is given, in characters. What makes a short PIN
 	// defensible is the dictionary attack lockout, which on capa allows 31 guesses and then about
 	// 144 a day: six digits take years to exhaust at that rate, four take weeks, and one is inside
 	// the first allowance. Only new keys are held to it; a key made before keeps its PIN.
@@ -64,12 +65,22 @@ const (
 	MaximumPINLength = sha256.Size
 )
 
-// ValidateNewPIN refuses a PIN too short for a new key, or too long for the TPM to take.
+// ValidateNewPIN refuses a PIN too short for a new key, or too long for the TPM to take, or one
+// holding a NUL byte. The length is counted in characters, as the lockout arithmetic assumes:
+// three letters outside ASCII are six bytes but nowhere near as many guesses as six digits. A NUL
+// is refused because go-tpm cuts the HMAC key at the first one while the TPM takes the whole value,
+// so a PIN with one inside can never authorize, and one of NULs alone is no PIN to the TPM at all.
 func ValidateNewPIN(pin []byte) error {
-	if len(pin) < MinimumPINLength {
+	if characters := utf8.RuneCount(pin); characters < MinimumPINLength {
 		return altshiftErrors.NewWithTrace(
 			fmt.Errorf("%w: a new PIN must be at least %d characters", altshiftErrors.ErrValidationError, MinimumPINLength),
-			len(pin),
+			characters,
+		)
+	}
+	if index := bytes.IndexByte(pin, 0); index >= 0 {
+		return altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: a PIN cannot hold a NUL byte", altshiftErrors.ErrValidationError),
+			index,
 		)
 	}
 	if len(pin) > MaximumPINLength {
@@ -677,6 +688,9 @@ func parentName(public *tpm2.TPMTPublic) ([]byte, error) {
 // real one, would learn the session key -- and with it the PIN, which creation sends encrypted
 // under that key, or enough to guess it offline, outside the lockout, from the HMAC a signature
 // is authorized with. A firmware TPM has no such bus.
+//
+// It guards signatures only. The name it checks against was taken unverified when the key was
+// made, so an interposer present then has already read the PIN and had its own name recorded.
 //
 // A key file with no recorded name, made before it was recorded or by another tool, is accepted:
 // there is nothing to check it against.
