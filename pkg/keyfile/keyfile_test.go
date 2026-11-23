@@ -245,3 +245,96 @@ func TestParentName(t *testing.T) {
 		})
 	}
 }
+
+// withPolicies is a key file as another tool might write it, with a policy, an authPolicy and a
+// secret. The explicit tags are spelt out by hand, since encoding/asn1 writes a RawValue as it
+// stands and would drop an explicit tag on the field.
+type withPolicies struct {
+	Type       asn1.ObjectIdentifier
+	Policy     asn1.RawValue
+	Secret     asn1.RawValue
+	AuthPolicy asn1.RawValue
+	Parent     int
+	PubKey     []byte
+	PrivKey    []byte
+}
+
+// TestPoliciesAreDropped pins what the container's comment says: a file with policies parses, and
+// marshalling the result writes none of them.
+func TestPoliciesAreDropped(t *testing.T) {
+	t.Parallel()
+
+	explicit := func(tag int, inner any) asn1.RawValue {
+		t.Helper()
+		encoded, err := asn1.Marshal(inner)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: tag, IsCompound: true, Bytes: encoded}
+	}
+	// A TPMPolicy is SEQUENCE { commandCode [0] INTEGER, commandPolicy [1] OCTET STRING }; the
+	// contents do not matter here, only that there is one.
+	type policy struct {
+		CommandCode   int    `asn1:"explicit,tag:0"`
+		CommandPolicy []byte `asn1:"explicit,tag:1"`
+	}
+	policies := []policy{{CommandCode: 0x16b, CommandPolicy: []byte{1, 2, 3}}}
+
+	der, err := asn1.Marshal(withPolicies{
+		Type:       OIDLoadableKey,
+		Policy:     explicit(1, policies),
+		Secret:     explicit(2, []byte{9, 9}),
+		AuthPolicy: explicit(3, []policy{}),
+		Parent:     0x40000001,
+		PubKey:     []byte{0x00, 0x02, 0xaa, 0xbb},
+		PrivKey:    []byte{0x00, 0x02, 0xcc, 0xdd},
+	})
+	if err != nil {
+		t.Fatalf("marshal fixture: %v", err)
+	}
+	var parsed container
+	if _, err := asn1.Unmarshal(der, &parsed); err != nil {
+		t.Fatalf("unmarshal fixture: %v", err)
+	}
+	if len(parsed.Policy.FullBytes) == 0 || len(parsed.Secret) == 0 || len(parsed.AuthPolicy.FullBytes) == 0 {
+		t.Fatalf("the fixture's policies were not read as policies: %+v", parsed)
+	}
+	withoutPolicies, err := (&Key{
+		Parent:  0x40000001,
+		Public:  []byte{0x00, 0x02, 0xaa, 0xbb},
+		Private: []byte{0x00, 0x02, 0xcc, 0xdd},
+	}).Marshal()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	testCases := []struct {
+		name string
+		data []byte
+		want []byte
+	}{
+		{
+			name: "policies parse and are not written back",
+			data: pem.EncodeToMemory(&pem.Block{Type: PEMType, Bytes: der}),
+			want: withoutPolicies,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			key, err := Parse(testCase.data)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			remarshalled, err := key.Marshal()
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if !bytes.Equal(remarshalled, testCase.want) {
+				t.Error("marshalling a parsed key with policies wrote something other than the key without them")
+			}
+		})
+	}
+}

@@ -26,9 +26,10 @@ var (
 	OIDSealedData    = asn1.ObjectIdentifier{2, 23, 133, 10, 1, 5}
 )
 
-// container mirrors the ASN.1 TPMKey SEQUENCE. Policy and AuthPolicy are kept as raw values
-// because this package does not implement policy sessions; preserving them means a parse/marshal
-// round trip does not silently drop a policy some other tool wrote.
+// container mirrors the ASN.1 TPMKey SEQUENCE. Policy, Secret and AuthPolicy are declared so that
+// a key file carrying them parses, but Key does not hold them and Marshal does not write them, so
+// a parse/marshal round trip drops them. This package implements no policy sessions: a key that
+// needs one to sign could not sign here anyway.
 type container struct {
 	Type        asn1.ObjectIdentifier
 	EmptyAuth   bool          `asn1:"optional,explicit,tag:0"`
@@ -132,7 +133,8 @@ func Parse(data []byte) (*Key, error) {
 	}, nil
 }
 
-// Marshal renders a key back to PEM.
+// Marshal renders a key to PEM. Any policy, authPolicy or secret the parsed file carried is not
+// written, since Key does not hold them.
 func (key *Key) Marshal() ([]byte, error) {
 	if key == nil {
 		return nil, nil_error.New("key")
