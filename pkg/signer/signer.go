@@ -606,6 +606,14 @@ func CreateKey(devicePath string, keyType KeyType, pin []byte, description strin
 		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("create key: %w", err))
 	}
 
+	createdPublic, err := created.OutPublic.Contents()
+	if err != nil {
+		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("created public contents: %w", err))
+	}
+	if err := checkCreated(template, createdPublic); err != nil {
+		return nil, fmt.Errorf("check created: %w", err)
+	}
+
 	return &keyfile.Key{
 		Description: description,
 		EmptyAuth:   len(pin) == 0,
@@ -614,6 +622,35 @@ func CreateKey(devicePath string, keyType KeyType, pin []byte, description strin
 		Private:     tpm2.Marshal(&created.OutPrivate),
 		ParentName:  name,
 	}, nil
+}
+
+// checkCreated holds the key the TPM made to the template it was asked for. TPM2_Create copies the
+// object attributes from the template, so anything but an exact match means something other than
+// a TPM doing as asked answered at the device. Above all FixedTPM, FixedParent and
+// SensitiveDataOrigin: without them the key could be duplicated off the chip, or its private half
+// came from outside it, and the key file would be nothing like what tpm-keygen says it is.
+func checkCreated(template *tpm2.TPMTPublic, created *tpm2.TPMTPublic) error {
+	if template == nil {
+		return nil_error.New("template")
+	}
+	if created == nil {
+		return nil_error.New("created")
+	}
+
+	if created.Type != template.Type || created.NameAlg != template.NameAlg {
+		return altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: the created key is not of the kind asked for", altshiftErrors.ErrVerificationError),
+			created.Type, template.Type, created.NameAlg, template.NameAlg,
+		)
+	}
+	if created.ObjectAttributes != template.ObjectAttributes {
+		return altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: the created key's attributes differ from the template's", altshiftErrors.ErrVerificationError),
+			fmt.Sprintf("%+v", created.ObjectAttributes), fmt.Sprintf("%+v", template.ObjectAttributes),
+		)
+	}
+
+	return nil
 }
 
 // parentName is the TPM name of a storage root key: its name algorithm, and the digest of its

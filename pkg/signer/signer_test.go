@@ -875,6 +875,91 @@ func TestVerifyParent(t *testing.T) {
 	}
 }
 
+func TestCheckCreated(t *testing.T) {
+	t.Parallel()
+
+	software, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	template, err := KeyTemplate(KeyTypeRSA2048, false)
+	if err != nil {
+		t.Fatalf("key template: %v", err)
+	}
+	eccTemplate, err := KeyTemplate(KeyTypeECCP256, false)
+	if err != nil {
+		t.Fatalf("key template: %v", err)
+	}
+
+	// created is the template as a TPM fills it in, changed by modify.
+	created := func(modify func(public *tpm2.TPMTPublic)) *tpm2.TPMTPublic {
+		public := *template
+		public.Unique = tpm2.NewTPMUPublicID(tpm2.TPMAlgRSA, &tpm2.TPM2BPublicKeyRSA{Buffer: software.N.Bytes()})
+		modify(&public)
+		return &public
+	}
+
+	testCases := []struct {
+		name      string
+		template  *tpm2.TPMTPublic
+		created   *tpm2.TPMTPublic
+		expectErr bool
+	}{
+		{name: "what was asked for", template: template, created: created(func(*tpm2.TPMTPublic) {})},
+		{
+			name:      "not fixed to the tpm",
+			template:  template,
+			created:   created(func(public *tpm2.TPMTPublic) { public.ObjectAttributes.FixedTPM = false }),
+			expectErr: true,
+		},
+		{
+			name:      "not fixed to its parent",
+			template:  template,
+			created:   created(func(public *tpm2.TPMTPublic) { public.ObjectAttributes.FixedParent = false }),
+			expectErr: true,
+		},
+		{
+			name:      "sensitive data from outside the tpm",
+			template:  template,
+			created:   created(func(public *tpm2.TPMTPublic) { public.ObjectAttributes.SensitiveDataOrigin = false }),
+			expectErr: true,
+		},
+		{
+			name:      "out from under the lockout",
+			template:  template,
+			created:   created(func(public *tpm2.TPMTPublic) { public.ObjectAttributes.NoDA = true }),
+			expectErr: true,
+		},
+		{
+			name:      "able to decrypt",
+			template:  template,
+			created:   created(func(public *tpm2.TPMTPublic) { public.ObjectAttributes.Decrypt = true }),
+			expectErr: true,
+		},
+		{
+			name:      "another name algorithm",
+			template:  template,
+			created:   created(func(public *tpm2.TPMTPublic) { public.NameAlg = tpm2.TPMAlgSHA1 }),
+			expectErr: true,
+		},
+		{name: "another type", template: eccTemplate, created: created(func(*tpm2.TPMTPublic) {}), expectErr: true},
+		{name: "nothing created", template: template, created: nil, expectErr: true},
+		{name: "no template", template: nil, created: created(func(*tpm2.TPMTPublic) {}), expectErr: true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := checkCreated(testCase.template, testCase.created)
+			if (err != nil) != testCase.expectErr {
+				t.Fatalf("error = %v, want an error: %v", err, testCase.expectErr)
+			}
+		})
+	}
+}
+
 // TestLive exercises the real chip. It is opt in because it generates keys, which takes seconds,
 // and because the wrong-PIN case deliberately increments the TPM's dictionary attack counter.
 //
