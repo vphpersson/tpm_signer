@@ -146,7 +146,7 @@ func LoadToken(path string, key *CacheKey) (*Token, error) {
 	if err := json.Unmarshal(data, &entry); err != nil {
 		return nil, nil
 	}
-	if entry.Token == nil || !entry.Key.equal(key) {
+	if entry.Token == nil || !entry.Key.equal(key) || ValidateAccessToken(entry.Token.AccessToken) != nil {
 		return nil, nil
 	}
 

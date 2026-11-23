@@ -285,6 +285,19 @@ func TestStoreAndLoadToken(t *testing.T) {
 	}
 }
 
+// storeRaw writes a cache file for key around an access token StoreToken would not be handed by
+// Exchange, as a file put in place by something else would be.
+func storeRaw(t *testing.T, directory string, key *CacheKey, accessToken string) string {
+	t.Helper()
+
+	path := filepath.Join(directory, "raw.json")
+	if err := StoreToken(path, key, &Token{AccessToken: accessToken, Expiry: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+
+	return path
+}
+
 func TestLoadTokenMissingOrCorrupt(t *testing.T) {
 	t.Parallel()
 
@@ -311,6 +324,7 @@ func TestLoadTokenMissingOrCorrupt(t *testing.T) {
 			path: write("legacy.json", `{"access_token":"ya29.x","expiry":"2099-01-01T00:00:00Z"}`),
 		},
 		{name: "a file with a key and no token yields no token", path: write("keyless.json", `{"key":{"service_account":"x"}}`)},
+		{name: "a token outside the b64token alphabet yields no token", path: storeRaw(t, directory, key, "ya29.x;touch pwned")},
 	}
 
 	for _, testCase := range testCases {

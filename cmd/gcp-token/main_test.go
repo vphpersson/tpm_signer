@@ -32,17 +32,32 @@ func TestEmit(t *testing.T) {
 
 	testCases := []struct {
 		name       string
-		token      string
+		given      string
 		exportForm bool
+		expectErr  bool
 		want       string
 	}{
-		{name: "bare token", token: "ya29.test", want: "ya29.test\n"},
+		{name: "bare token", given: "ya29.test", want: "ya29.test\n"},
 		{
 			name:       "export statement",
-			token:      "ya29.test",
+			given:      "ya29.test",
 			exportForm: true,
 			want:       "export GOOGLE_OAUTH_ACCESS_TOKEN=ya29.test\n",
 		},
+		{
+			name:       "every character of the alphabet",
+			given:      "access.AZaz09._~+/=-",
+			exportForm: true,
+			want:       "export GOOGLE_OAUTH_ACCESS_TOKEN=access.AZaz09._~+/=-\n",
+		},
+		{name: "a command after the assignment", given: "access;touch${IFS}pwned", exportForm: true, expectErr: true},
+		{name: "a command substitution", given: "$(touch pwned)", exportForm: true, expectErr: true},
+		{name: "a backtick substitution", given: "`touch pwned`", exportForm: true, expectErr: true},
+		{name: "a second line", given: "access\ntouch pwned", exportForm: true, expectErr: true},
+		{name: "a space", given: "access touch", exportForm: true, expectErr: true},
+		{name: "a quote, bare, would break the docker helper's JSON", given: `access"}`, expectErr: true},
+		{name: "a non-ascii byte", given: "access\u00e9", expectErr: true},
+		{name: "empty", given: "", expectErr: true},
 	}
 
 	for _, testCase := range testCases {
@@ -50,7 +65,19 @@ func TestEmit(t *testing.T) {
 			t.Parallel()
 
 			var output bytes.Buffer
-			emit(&output, testCase.token, testCase.exportForm)
+			err := emit(&output, testCase.given, testCase.exportForm)
+			if testCase.expectErr {
+				if err == nil {
+					t.Error("expected an error, got none")
+				}
+				if output.Len() != 0 {
+					t.Errorf("printed %q for a token that was refused", output.String())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 
 			if output.String() != testCase.want {
 				t.Errorf("emitted %q, want %q", output.String(), testCase.want)

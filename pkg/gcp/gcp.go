@@ -55,6 +55,37 @@ type Token struct {
 	Expiry      time.Time `json:"expiry,omitzero"`
 }
 
+// ValidateAccessToken refuses an access token with any character outside [A-Za-z0-9._~+/=-], the
+// RFC 6750 b64token alphabet with '=' allowed anywhere. Google's tokens keep to it, and so a token
+// that does not is not one of theirs: printed into a shell statement, an HTTP header or a JSON
+// string, it could be code, a second header or a broken document. The error does not quote the
+// token, which is a secret if it is anything.
+func ValidateAccessToken(token string) error {
+	if token == "" {
+		return empty_error.New("access token")
+	}
+
+	for index := range len(token) {
+		if !isTokenCharacter(token[index]) {
+			return altshiftErrors.NewWithTrace(
+				fmt.Errorf("%w: access token has a character outside the b64token alphabet", altshiftErrors.ErrValidationError),
+				index,
+			)
+		}
+	}
+
+	return nil
+}
+
+func isTokenCharacter(character byte) bool {
+	switch {
+	case 'A' <= character && character <= 'Z', 'a' <= character && character <= 'z', '0' <= character && character <= '9':
+		return true
+	default:
+		return strings.IndexByte("._~+/=-", character) >= 0
+	}
+}
+
 // Valid reports whether the token is usable, keeping a margin so a token does not expire midway
 // through a long Terraform run.
 func (token *Token) Valid(margin time.Duration) bool {
@@ -216,8 +247,8 @@ func (client *Client) Exchange(ctx context.Context, assertion string) (*Token, e
 			fmt.Errorf("%w: unmarshal token response: %w", altshiftErrors.ErrParseError, err),
 		)
 	}
-	if parsed.AccessToken == "" {
-		return nil, empty_error.New("access token")
+	if err := ValidateAccessToken(parsed.AccessToken); err != nil {
+		return nil, fmt.Errorf("validate access token: %w", err)
 	}
 
 	return &Token{

@@ -198,6 +198,20 @@ func TestClientExchange(t *testing.T) {
 			assertion: "a.b.c",
 			expectErr: true,
 		},
+		{
+			name:      "an access token with shell syntax in it",
+			status:    http.StatusOK,
+			body:      `{"access_token":"ya29.x;touch pwned","token_type":"Bearer","expires_in":3599}`,
+			assertion: "a.b.c",
+			expectErr: true,
+		},
+		{
+			name:      "an access token with a quote in it",
+			status:    http.StatusOK,
+			body:      `{"access_token":"ya29.x\"","token_type":"Bearer","expires_in":3599}`,
+			assertion: "a.b.c",
+			expectErr: true,
+		},
 		{name: "empty assertion", assertion: "", expectErr: true},
 	}
 
@@ -268,6 +282,43 @@ func TestTokenValid(t *testing.T) {
 
 			if got := testCase.token.Valid(testCase.margin); got != testCase.want {
 				t.Errorf("Valid() = %v, want %v", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestValidateAccessToken(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name      string
+		given     string
+		expectErr bool
+	}{
+		{name: "a google access token", given: "access.a0AfB_byC-Example.Part2"},
+		{name: "every character allowed", given: "AZaz09._~+/=-"},
+		{name: "padding", given: "abc=="},
+		{name: "empty", given: "", expectErr: true},
+		{name: "a semicolon", given: "a;b", expectErr: true},
+		{name: "a dollar", given: "a$b", expectErr: true},
+		{name: "a backtick", given: "a`b", expectErr: true},
+		{name: "a space", given: "a b", expectErr: true},
+		{name: "a newline", given: "a\nb", expectErr: true},
+		{name: "a carriage return", given: "a\rb", expectErr: true},
+		{name: "a nul", given: "a\x00b", expectErr: true},
+		{name: "a double quote", given: `a"b`, expectErr: true},
+		{name: "a single quote", given: "a'b", expectErr: true},
+		{name: "a backslash", given: `a\b`, expectErr: true},
+		{name: "a utf-8 letter", given: "a\u00e9b", expectErr: true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := ValidateAccessToken(testCase.given)
+			if (err != nil) != testCase.expectErr {
+				t.Errorf("error = %v, want an error: %v", err, testCase.expectErr)
 			}
 		})
 	}

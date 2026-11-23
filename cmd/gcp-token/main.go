@@ -193,18 +193,30 @@ func run() error {
 		return fmt.Errorf("token for: %w", err)
 	}
 
-	emit(os.Stdout, token.AccessToken, cfg.exportForm)
+	if err := emit(os.Stdout, token.AccessToken, cfg.exportForm); err != nil {
+		return fmt.Errorf("emit: %w", err)
+	}
 
 	return nil
 }
 
-func emit(writer io.Writer, token string, exportForm bool) {
-	if exportForm {
-		_, _ = fmt.Fprintf(writer, "export GOOGLE_OAUTH_ACCESS_TOKEN=%s\n", token)
-		return
+// emit prints the token, bare or as a shell statement. Either way it is checked first: the
+// statement is meant for eval, so a token carrying shell syntax would run as code, and the bare
+// form is pasted into JSON and environment variables by the scripts that call this.
+func emit(writer io.Writer, token string, exportForm bool) error {
+	if err := gcp.ValidateAccessToken(token); err != nil {
+		return fmt.Errorf("validate access token: %w", err)
 	}
 
-	_, _ = fmt.Fprintln(writer, token)
+	format := "%s\n"
+	if exportForm {
+		format = "export GOOGLE_OAUTH_ACCESS_TOKEN=%s\n"
+	}
+	if _, err := fmt.Fprintf(writer, format, token); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+
+	return nil
 }
 
 func defaultKeyPath() string {
