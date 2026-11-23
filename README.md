@@ -6,7 +6,7 @@ The point is to remove permanent, portable secrets from disk. A service account 
 
 ## What it is not
 
-The access token this mints is still a bearer token. It lives in RAM and in the environment for up to an hour, and it can be replayed by anything that lifts it during that window. What the TPM buys is that there is no permanent secret at rest, and nothing on disk works on another machine. Closing the remaining gap needs certificate-bound tokens (RFC 8705), which is a much larger piece of machinery.
+The access token this mints is still a bearer token. For up to an hour it lives in the environment of the commands it is handed to and, unless `--no-cache`, in a tmpfs file under `XDG_RUNTIME_DIR`, both readable by anything running as you, and it can be replayed by anything that lifts it during that window. What the TPM buys is that there is no permanent secret at rest, and nothing on disk works on another machine. Closing the remaining gap needs certificate-bound tokens (RFC 8705), which is a much larger piece of machinery.
 
 ## Layout
 
@@ -114,7 +114,7 @@ That is roughly 144 guesses per day on capa after the initial allowance, which i
 
 A key made with `--no-pin` is created with `NoDA` set instead. With no auth value there is nothing to guess, so the lockout would protect nothing, and it would let failed PINs against other keys on the same chip lock an unattended job out for a day.
 
-A PIN defends against something running in the background as you. It does not defend against an attacker who is already present and can keylog it, or who waits until you have entered it and uses the loaded key. `--no-pin` is available and matches how `ssh-tpm-agent` keys are normally configured; it is the right choice when the threat is a stolen laptop rather than local malware.
+A PIN keeps something running in the background as you from making the TPM sign, so it cannot mint a token of its own. It does not keep it from the tokens you mint. After the first mint each hour, the token sits in a file under `$XDG_RUNTIME_DIR/tpm-signer/` that any process running as you can read, and in the environment of every command it was handed to, which `/proc/<pid>/environ` shows to those same processes. Until the token expires, such a process can use it as freely as you can, with no PIN at all. `--no-cache` keeps the token out of the file but not out of the environment, and asks for the PIN every time. So against local malware a PIN does not shut it out: it confines it to the hours in which you mint tokens anyway. Nor does a PIN defend against an attacker who can keylog it, or read it from the memory of the process it was typed into. `--no-pin` is available and matches how `ssh-tpm-agent` keys are normally configured; it is the right choice when the threat is a stolen laptop rather than local malware.
 
 ## Tests
 
