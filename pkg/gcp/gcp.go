@@ -42,11 +42,22 @@ const (
 
 	// maxAssertionLifetime is the ceiling Google places on an assertion's validity.
 	maxAssertionLifetime = time.Hour
+	// assertionLifetime is how long an assertion MintToken signs stays good. It is exchanged the
+	// moment it is made, so minutes are plenty, and whatever lifts one on the way has only that
+	// long to trade it for tokens of its own.
+	assertionLifetime = 5 * time.Minute
+	// exchangeTimeout bounds the exchange when the caller brings no HTTP client of its own.
+	exchangeTimeout = 30 * time.Second
 )
 
-// ErrTokenEndpointRejected reports that Google refused the assertion. It is most often a clock
-// skew, an unregistered public key, or a service account that does not match the key.
-var ErrTokenEndpointRejected = errors.New("the token endpoint rejected the assertion")
+var (
+	// ErrTokenEndpointRejected reports that Google refused the assertion. It is most often a clock
+	// skew, an unregistered public key, or a service account that does not match the key.
+	ErrTokenEndpointRejected = errors.New("the token endpoint rejected the assertion")
+	// ErrRedirectRefused reports that the token endpoint answered with a redirect, which is not
+	// followed: following a 307 or 308 would post the assertion again, to wherever it pointed.
+	ErrRedirectRefused = errors.New("the token endpoint redirected, and the assertion is not sent on")
+)
 
 // Token is an access token with the wall-clock time it stops working.
 type Token struct {
@@ -172,7 +183,8 @@ func Assertion(
 
 // Client exchanges signed assertions for access tokens.
 type Client struct {
-	// HTTPClient is the client used for the exchange; http.DefaultClient when nil.
+	// HTTPClient is the client used for the exchange: a copy of it, rather, that never follows a
+	// redirect. When nil, the exchange gets a client of its own with a 30-second timeout.
 	HTTPClient *http.Client
 	// Endpoint overrides the Google token endpoint. It exists so tests can point the exchange at
 	// a local server; leave it empty in production.
@@ -187,12 +199,21 @@ func (client *Client) resolvedEndpoint() string {
 	return client.Endpoint
 }
 
+// resolvedHTTPClient is the client the exchange goes through. It is always a fresh one, so that
+// refusing redirects never reaches into a client the caller shares with anything else.
 func (client *Client) resolvedHTTPClient() *http.Client {
-	if client == nil || client.HTTPClient == nil {
-		return http.DefaultClient
+	resolved := &http.Client{Timeout: exchangeTimeout}
+	if client != nil && client.HTTPClient != nil {
+		copied := *client.HTTPClient
+		resolved = &copied
 	}
+	resolved.CheckRedirect = refuseRedirect
 
-	return client.HTTPClient
+	return resolved
+}
+
+func refuseRedirect(*http.Request, []*http.Request) error {
+	return ErrRedirectRefused
 }
 
 // Exchange trades a signed assertion for an access token.
@@ -265,7 +286,7 @@ func (client *Client) MintToken(
 	serviceAccount string,
 	scopes []string,
 ) (*Token, error) {
-	assertion, err := Assertion(signer, serviceAccount, scopes, time.Now(), maxAssertionLifetime)
+	assertion, err := Assertion(signer, serviceAccount, scopes, time.Now(), assertionLifetime)
 	if err != nil {
 		return nil, altshiftErrors.New(fmt.Errorf("assertion: %w", err))
 	}

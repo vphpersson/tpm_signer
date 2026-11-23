@@ -10,9 +10,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -319,6 +321,141 @@ func TestValidateAccessToken(t *testing.T) {
 			err := ValidateAccessToken(testCase.given)
 			if (err != nil) != testCase.expectErr {
 				t.Errorf("error = %v, want an error: %v", err, testCase.expectErr)
+			}
+		})
+	}
+}
+
+// TestExchangeRefusesRedirects points the exchange at an endpoint that redirects to another, and
+// checks that the other never sees the assertion.
+func TestExchangeRefusesRedirects(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name       string
+		status     int
+		httpClient *http.Client
+	}{
+		{name: "a 307 with the default client", status: http.StatusTemporaryRedirect},
+		{name: "a 308 with the default client", status: http.StatusPermanentRedirect},
+		{name: "a 302 with the default client", status: http.StatusFound},
+		{name: "a 307 with the caller's client", status: http.StatusTemporaryRedirect, httpClient: &http.Client{}},
+		{name: "a 308 with the caller's client", status: http.StatusPermanentRedirect, httpClient: &http.Client{}},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var mutex sync.Mutex
+			var received []string
+			elsewhere := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				_ = request.ParseForm()
+				mutex.Lock()
+				received = append(received, request.PostForm.Get("assertion"))
+				mutex.Unlock()
+				_, _ = writer.Write([]byte(`{"access_token":"stolen","expires_in":3599}`))
+			}))
+			defer elsewhere.Close()
+
+			redirecting := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				http.Redirect(writer, request, elsewhere.URL, testCase.status)
+			}))
+			defer redirecting.Close()
+
+			client := &Client{Endpoint: redirecting.URL, HTTPClient: testCase.httpClient}
+			if _, err := client.Exchange(t.Context(), "a.b.c"); !errors.Is(err, ErrRedirectRefused) {
+				t.Errorf("error = %v, want ErrRedirectRefused", err)
+			}
+
+			mutex.Lock()
+			defer mutex.Unlock()
+			if len(received) != 0 {
+				t.Errorf("the redirect target was sent %q", received)
+			}
+		})
+	}
+}
+
+func TestResolvedHTTPClient(t *testing.T) {
+	t.Parallel()
+
+	shared := &http.Client{Timeout: 7 * time.Second}
+
+	testCases := []struct {
+		name        string
+		client      *Client
+		wantTimeout time.Duration
+	}{
+		{name: "a nil client gets a timeout", client: nil, wantTimeout: exchangeTimeout},
+		{name: "no http client gets a timeout", client: &Client{}, wantTimeout: exchangeTimeout},
+		{name: "the caller's timeout is kept", client: &Client{HTTPClient: shared}, wantTimeout: 7 * time.Second},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			resolved := testCase.client.resolvedHTTPClient()
+			if resolved.Timeout != testCase.wantTimeout {
+				t.Errorf("timeout = %v, want %v", resolved.Timeout, testCase.wantTimeout)
+			}
+			if resolved.CheckRedirect == nil {
+				t.Error("redirects would be followed")
+			}
+			if resolved == http.DefaultClient || resolved == shared {
+				t.Error("the exchange changed a client it does not own")
+			}
+			if shared.CheckRedirect != nil {
+				t.Error("the caller's client was changed")
+			}
+		})
+	}
+}
+
+// TestMintTokenAssertionLifetime reads the assertion as the endpoint receives it.
+func TestMintTokenAssertionLifetime(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name         string
+		wantLifetime time.Duration
+	}{
+		{name: "an assertion lasts minutes, not the hour google allows", wantLifetime: 5 * time.Minute},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var mutex sync.Mutex
+			var claims map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				_ = request.ParseForm()
+				parts := strings.Split(request.PostForm.Get("assertion"), ".")
+				if len(parts) == 3 {
+					mutex.Lock()
+					decodeSegment(t, parts[1], &claims)
+					mutex.Unlock()
+				}
+				_, _ = writer.Write([]byte(`{"access_token":"ya29.test","expires_in":3599}`))
+			}))
+			defer server.Close()
+
+			client := &Client{Endpoint: server.URL}
+			if _, err := client.MintToken(t.Context(), softwareKey(t), "robot@project.iam.gserviceaccount.com", []string{ScopeCloudPlatform}); err != nil {
+				t.Fatalf("mint token: %v", err)
+			}
+
+			mutex.Lock()
+			defer mutex.Unlock()
+			issuedAt, okIssued := claims["iat"].(float64)
+			expiry, okExpiry := claims["exp"].(float64)
+			if !okIssued || !okExpiry {
+				t.Fatalf("claims %v lack iat or exp", claims)
+			}
+			if lifetime := time.Duration(expiry-issuedAt) * time.Second; lifetime != testCase.wantLifetime {
+				t.Errorf("assertion lifetime = %v, want %v", lifetime, testCase.wantLifetime)
 			}
 		})
 	}
