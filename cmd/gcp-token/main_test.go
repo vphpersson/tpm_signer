@@ -135,6 +135,8 @@ func testKey(t *testing.T) *keyfile.Key {
 		Parent:  0x40000001,
 		Public:  tpm2.Marshal(&public),
 		Private: tpm2.Marshal(&private),
+		// As a current tpm-keygen records it; nothing here checks it against a TPM.
+		ParentName: []byte{0x00, 0x0b, 0x01, 0x02},
 	}
 }
 
@@ -498,6 +500,51 @@ func TestParseArguments(t *testing.T) {
 			}
 			if cfg.serviceAccount != testServiceAccount {
 				t.Errorf("service account = %q, want %q", cfg.serviceAccount, testServiceAccount)
+			}
+		})
+	}
+}
+
+//nolint:paralleltest // t.Setenv mutates process state and cannot run alongside other tests.
+func TestTokenForWarnsOfAnUnrecordedParent(t *testing.T) {
+	legacy := func() *keyfile.Key {
+		key := testKey(t)
+		key.ParentName = nil
+		return key
+	}
+	noPIN := legacy()
+	noPIN.EmptyAuth = true
+
+	testCases := []struct {
+		name        string
+		key         *keyfile.Key
+		cached      bool
+		wantWarning bool
+	}{
+		{name: "a pin key from before the name was recorded", key: legacy(), wantWarning: true},
+		{name: "a pin key with the name recorded", key: testKey(t)},
+		{name: "a key without a pin has nothing to lose to an impostor", key: noPIN},
+		{name: "a cached token does not use the key", key: legacy(), cached: true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) { //nolint:paralleltest // t.Setenv, as above.
+			t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+			cfg := &config{serviceAccount: testServiceAccount, scopes: []string{gcp.ScopeCloudPlatform}}
+
+			mint, _ := countingMinter()
+			if testCase.cached {
+				if _, err := tokenFor(cfg, testCase.key, mint, io.Discard); err != nil {
+					t.Fatalf("seed the cache: %v", err)
+				}
+			}
+
+			var warnings bytes.Buffer
+			if _, err := tokenFor(cfg, testCase.key, mint, &warnings); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := strings.Contains(warnings.String(), unrecordedParentWarning); got != testCase.wantWarning {
+				t.Errorf("warned = %v (%q), want %v", got, warnings.String(), testCase.wantWarning)
 			}
 		})
 	}

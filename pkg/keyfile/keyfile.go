@@ -40,6 +40,12 @@ type container struct {
 	Parent      int
 	PubKey      []byte
 	PrivKey     []byte
+	// ParentName is not in the TCG format. It follows the last of the format's own elements, where
+	// encoding/asn1 lets an older reader skip it -- as X.509 has long added fields -- so a key file
+	// that carries it still loads in an earlier build of this package, and one that lacks it is
+	// byte for byte what it always was. OpenSSL's TPM providers decode the SEQUENCE strictly and
+	// refuse an element they do not know.
+	ParentName []byte `asn1:"optional,explicit,tag:16"`
 }
 
 // Key is a parsed loadable TPM key.
@@ -57,6 +63,10 @@ type Key struct {
 	Public []byte
 	// Private is a marshalled TPM2B_PRIVATE, size prefix included.
 	Private []byte
+	// ParentName is the TPM name of the storage root key the key was created under, recorded so
+	// that the one the TPM hands back at signing time can be checked against it. Key files from
+	// before it was recorded, and from other tools, have none.
+	ParentName []byte
 }
 
 // Parse reads a PEM-wrapped TPM key.
@@ -118,6 +128,7 @@ func Parse(data []byte) (*Key, error) {
 		Parent:      uint32(parsed.Parent),
 		Public:      parsed.PubKey,
 		Private:     parsed.PrivKey,
+		ParentName:  parsed.ParentName,
 	}, nil
 }
 
@@ -141,10 +152,20 @@ func (key *Key) Marshal() ([]byte, error) {
 		Parent:      int(key.Parent),
 		PubKey:      key.Public,
 		PrivKey:     key.Private,
+		// An empty name is left out altogether rather than written as an empty element.
+		ParentName: nonEmpty(key.ParentName),
 	})
 	if err != nil {
 		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("asn1 marshal: %w", err))
 	}
 
 	return pem.EncodeToMemory(&pem.Block{Type: PEMType, Bytes: data}), nil
+}
+
+func nonEmpty(data []byte) []byte {
+	if len(data) == 0 {
+		return nil
+	}
+
+	return data
 }

@@ -800,6 +800,81 @@ func TestCreateKeyRefusesShortPIN(t *testing.T) {
 	}
 }
 
+// srkPublic is a storage root key's public area as CreatePrimary returns it, around a software
+// key's point.
+func srkPublic(t *testing.T) *tpm2.TPMTPublic {
+	t.Helper()
+
+	software, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	x, y := pointCoordinates(t, &software.PublicKey)
+
+	public := tpm2.ECCSRKTemplate
+	public.Unique = tpm2.NewTPMUPublicID(tpm2.TPMAlgECC, &tpm2.TPMSECCPoint{
+		X: tpm2.TPM2BECCParameter{Buffer: x},
+		Y: tpm2.TPM2BECCParameter{Buffer: y},
+	})
+
+	return &public
+}
+
+func TestVerifyParent(t *testing.T) {
+	t.Parallel()
+
+	srk := srkPublic(t)
+	impostor := srkPublic(t)
+
+	recorded, err := parentName(srk)
+	if err != nil {
+		t.Fatalf("parent name: %v", err)
+	}
+	// A TPM name is the name algorithm, then the digest of the public area under it.
+	if len(recorded) != 2+sha256.Size || recorded[0] != 0x00 || recorded[1] != byte(tpm2.TPMAlgSHA256) {
+		t.Fatalf("name %x is not a SHA-256 TPM name", recorded)
+	}
+
+	testCases := []struct {
+		name             string
+		recorded         []byte
+		public           *tpm2.TPMTPublic
+		expectErr        bool
+		wantVerification bool
+	}{
+		{name: "the storage root key the key was created under", recorded: recorded, public: srk},
+		{
+			name:             "an impostor in its place is refused",
+			recorded:         recorded,
+			public:           impostor,
+			expectErr:        true,
+			wantVerification: true,
+		},
+		{name: "a key file with no name recorded is accepted", recorded: nil, public: impostor},
+		{name: "no public area to check", recorded: recorded, public: nil, expectErr: true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := verifyParent(testCase.recorded, testCase.public)
+			if !testCase.expectErr {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected an error, got none")
+			}
+			if got := errors.Is(err, altshiftErrors.ErrVerificationError); got != testCase.wantVerification {
+				t.Errorf("error %v: verification = %v, want %v", err, got, testCase.wantVerification)
+			}
+		})
+	}
+}
+
 // TestLive exercises the real chip. It is opt in because it generates keys, which takes seconds,
 // and because the wrong-PIN case deliberately increments the TPM's dictionary attack counter.
 //
@@ -829,6 +904,9 @@ func TestLive(t *testing.T) { //nolint:paralleltest // Drives the real TPM, whic
 			}
 			t.Logf("created in %v", time.Since(start).Round(time.Millisecond))
 
+			if len(created.ParentName) == 0 {
+				t.Error("the key file records no storage root key name")
+			}
 			if created.EmptyAuth != (len(testCase.pin) == 0) {
 				t.Errorf("EmptyAuth = %v for a key created with a %d-byte PIN", created.EmptyAuth, len(testCase.pin))
 			}

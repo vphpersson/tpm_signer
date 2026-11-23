@@ -439,6 +439,10 @@ func (signer *Signer) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (
 	if err != nil {
 		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("primary public contents: %w", err))
 	}
+	// Before the PIN is asked for, and before a session is salted to this key.
+	if err := verifyParent(signer.key.ParentName, primaryPublic); err != nil {
+		return nil, fmt.Errorf("verify parent: %w", err)
+	}
 
 	loaded, err := tpm2.Load{
 		ParentHandle: tpm2.AuthHandle{
@@ -562,6 +566,13 @@ func CreateKey(devicePath string, keyType KeyType, pin []byte, description strin
 		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("primary public contents: %w", err))
 	}
 
+	// Recorded in the key file, so that every signature can check that the storage root key the
+	// session is salted to is this one.
+	name, err := parentName(primaryPublic)
+	if err != nil {
+		return nil, fmt.Errorf("parent name: %w", err)
+	}
+
 	// Creation carries the PIN into the chip, so it gets the same encrypted session treatment as
 	// signing does.
 	session, closeSession, err := tpm2.HMACSession(
@@ -601,7 +612,57 @@ func CreateKey(devicePath string, keyType KeyType, pin []byte, description strin
 		Parent:      ownerHierarchy,
 		Public:      tpm2.Marshal(&created.OutPublic),
 		Private:     tpm2.Marshal(&created.OutPrivate),
+		ParentName:  name,
 	}, nil
+}
+
+// parentName is the TPM name of a storage root key: its name algorithm, and the digest of its
+// public area under it.
+func parentName(public *tpm2.TPMTPublic) ([]byte, error) {
+	if public == nil {
+		return nil, nil_error.New("public")
+	}
+
+	name, err := tpm2.ObjectName(public)
+	if err != nil {
+		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("object name: %w", err))
+	}
+	if name == nil || len(name.Buffer) == 0 {
+		return nil, empty_error.New("object name")
+	}
+
+	return name.Buffer, nil
+}
+
+// verifyParent checks the storage root key CreatePrimary returned against the name recorded when
+// the key was made. Nothing else vouches for it, and the session is salted to it: on a discrete
+// TPM, an interposer on the bus that put its own key in the answer, and passed the salt on to the
+// real one, would learn the session key -- and with it the PIN, which creation sends encrypted
+// under that key, or enough to guess it offline, outside the lockout, from the HMAC a signature
+// is authorized with. A firmware TPM has no such bus.
+//
+// A key file with no recorded name, made before it was recorded or by another tool, is accepted:
+// there is nothing to check it against.
+func verifyParent(recorded []byte, public *tpm2.TPMTPublic) error {
+	if len(recorded) == 0 {
+		return nil
+	}
+
+	name, err := parentName(public)
+	if err != nil {
+		return fmt.Errorf("parent name: %w", err)
+	}
+	if !bytes.Equal(name, recorded) {
+		return altshiftErrors.NewWithTrace(
+			fmt.Errorf(
+				"%w: the TPM's storage root key is not the one the key was created under",
+				altshiftErrors.ErrVerificationError,
+			),
+			name, recorded,
+		)
+	}
+
+	return nil
 }
 
 // flushContext releases a transient object slot. TPMs have very few, and leaking them wedges

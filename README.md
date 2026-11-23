@@ -100,6 +100,8 @@ Under systemd this wants `SupplementaryGroups=tss` or membership in that group, 
 
 The PIN is the key's TPM auth value, not a passphrase over an encrypted file. It is never sent to the chip in the clear: the session is salted to the storage root key and encrypts command parameters, so the PIN only ever keys an HMAC.
 
+Nothing vouches for the storage root key the TPM hands back, and on a discrete TPM an interposer on the bus could put its own in its place, pass the salt on to the real one, and learn the session key: enough to read the PIN as a key is created, or to guess it offline, outside the lockout, from the HMAC a signature carries. So `tpm-keygen` records the storage root key's name in the key file, and every signature checks the TPM's against it before the PIN is asked for. A key file made before that has no name to check; it is accepted, and `gcp-token` warns when it mints with one that has a PIN. The name follows the last element of the TCG format, where earlier builds of this package skip it, so they load new key files; OpenSSL's TPM providers decode strictly and refuse them.
+
 Because a key with a PIN is created with `NoDA` false, it sits under the TPM's dictionary attack lockout. On the machines it runs on:
 
 | parameter | capa (AMD fTPM) | saviour (Infineon) |
