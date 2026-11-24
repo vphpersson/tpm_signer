@@ -28,7 +28,7 @@ The boundary between `pkg/signer` and `pkg/gcp` is stdlib `crypto.Signer`. Nothi
 | `rsa-2048` (default) | Google | Google accepts only RSA service account keys and signs assertions only with RS256. |
 | `ecc-p256` | ES256, anywhere else | Quicker to create, and a signature is 70-odd bytes rather than 256. |
 
-Both are created with a null scheme, and `Sign` chooses at sign time: RSASSA-PKCS1-v1_5 or ECDSA, over a SHA-256 digest either way. An ECDSA signature comes back ASN.1 DER encoded, as `crypto.Signer` requires and as `ecdsa.VerifyASN1` and `crypto/x509` read it; a JWS wants the fixed-width `r || s` instead, and converting is the caller's job, as it is for any other `crypto.Signer`. `gcp.Assertion` refuses a non-RSA signer up front rather than let Google refuse the result.
+Both are created with a null scheme, and `Sign` chooses at sign time: RSASSA-PKCS1-v1_5 or ECDSA, over a SHA-256 digest either way. An RSA signer that `AllowSHA1` has been called on also signs a SHA-1 digest, which is what the Android Debug Bridge's handshake needs; since the other end chooses that digest, such a key must be kept for that protocol and sign nothing else. An ECDSA signature comes back ASN.1 DER encoded, as `crypto.Signer` requires and as `ecdsa.VerifyASN1` and `crypto/x509` read it; a JWS wants the fixed-width `r || s` instead, and converting is the caller's job, as it is for any other `crypto.Signer`. `gcp.Assertion` refuses a non-RSA signer up front rather than let Google refuse the result.
 
 Timings, per operation, including re-deriving the storage root key each time:
 

@@ -8,6 +8,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1" //nolint:gosec // adb's challenge is signed as a SHA-1 digest
 	"crypto/sha256"
 	"encoding/asn1"
 	"errors"
@@ -383,20 +384,25 @@ func TestSignatureScheme(t *testing.T) {
 	testCases := []struct {
 		name      string
 		publicKey crypto.PublicKey
+		hash      crypto.Hash
 		expectErr bool
 		want      tpm2.TPMAlgID
+		wantHash  tpm2.TPMAlgID
 	}{
-		{name: "rsa signs with rsassa", publicKey: &rsaKey.PublicKey, want: tpm2.TPMAlgRSASSA},
-		{name: "ecc signs with ecdsa", publicKey: &eccKey.PublicKey, want: tpm2.TPMAlgECDSA},
-		{name: "ed25519 is not a tpm key", publicKey: edPublic, expectErr: true},
-		{name: "nil", publicKey: nil, expectErr: true},
+		{name: "rsa signs with rsassa", publicKey: &rsaKey.PublicKey, hash: crypto.SHA256, want: tpm2.TPMAlgRSASSA, wantHash: tpm2.TPMAlgSHA256},
+		{name: "rsa over sha-1", publicKey: &rsaKey.PublicKey, hash: crypto.SHA1, want: tpm2.TPMAlgRSASSA, wantHash: tpm2.TPMAlgSHA1},
+		{name: "ecc signs with ecdsa", publicKey: &eccKey.PublicKey, hash: crypto.SHA256, want: tpm2.TPMAlgECDSA, wantHash: tpm2.TPMAlgSHA256},
+		{name: "ecc never over sha-1", publicKey: &eccKey.PublicKey, hash: crypto.SHA1, expectErr: true},
+		{name: "another hash", publicKey: &rsaKey.PublicKey, hash: crypto.SHA512, expectErr: true},
+		{name: "ed25519 is not a tpm key", publicKey: edPublic, hash: crypto.SHA256, expectErr: true},
+		{name: "nil", publicKey: nil, hash: crypto.SHA256, expectErr: true},
 	}
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			scheme, err := signatureScheme(testCase.publicKey)
+			scheme, err := signatureScheme(testCase.publicKey, testCase.hash)
 			if testCase.expectErr {
 				if err == nil {
 					t.Fatal("expected an error, got none")
@@ -422,8 +428,8 @@ func TestSignatureScheme(t *testing.T) {
 			if err != nil {
 				t.Fatalf("scheme details: %v", err)
 			}
-			if details.HashAlg != tpm2.TPMAlgSHA256 {
-				t.Errorf("hash = %v, want SHA-256", details.HashAlg)
+			if details.HashAlg != testCase.wantHash {
+				t.Errorf("hash = %v, want %v", details.HashAlg, testCase.wantHash)
 			}
 		})
 	}
@@ -589,8 +595,15 @@ func TestNew(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if signer.scheme.Scheme != testCase.wantScheme {
-				t.Errorf("scheme = %v, want %v", signer.scheme.Scheme, testCase.wantScheme)
+			scheme, err := signatureScheme(signer.Public(), crypto.SHA256)
+			if err != nil {
+				t.Fatalf("signature scheme: %v", err)
+			}
+			if scheme.Scheme != testCase.wantScheme {
+				t.Errorf("scheme = %v, want %v", scheme.Scheme, testCase.wantScheme)
+			}
+			if signer.allowSHA1 {
+				t.Error("a new signer allows SHA-1")
 			}
 		})
 	}
@@ -613,7 +626,16 @@ func TestSignRejectsUnsupportedOptions(t *testing.T) {
 		t.Fatalf("new signer: %v", err)
 	}
 
+	sha1Signer, err := New(testKey(t), DefaultDevicePath, provider)
+	if err != nil {
+		t.Fatalf("new signer: %v", err)
+	}
+	if err := sha1Signer.AllowSHA1(); err != nil {
+		t.Fatalf("allow sha-1: %v", err)
+	}
+
 	digest := sha256.Sum256([]byte("payload"))
+	sha1Digest := sha1.Sum([]byte("payload")) //nolint:gosec // the digest adb signs
 
 	testCases := []struct {
 		name   string
@@ -622,6 +644,10 @@ func TestSignRejectsUnsupportedOptions(t *testing.T) {
 		opts   crypto.SignerOpts
 	}{
 		{name: "nil opts", signer: rsaSigner, digest: digest[:], opts: nil},
+		{name: "sha-1 not allowed", signer: rsaSigner, digest: sha1Digest[:], opts: crypto.SHA1},
+		{name: "sha-1 allowed, but a sha-256 length", signer: sha1Signer, digest: digest[:], opts: crypto.SHA1},
+		{name: "sha-1 allowed, still no other hash", signer: sha1Signer, digest: digest[:], opts: crypto.SHA512},
+		{name: "ecc sha-1", signer: eccSigner, digest: sha1Digest[:], opts: crypto.SHA1},
 		{name: "pss is not supported", signer: rsaSigner, digest: digest[:], opts: &rsa.PSSOptions{Hash: crypto.SHA256}},
 		{name: "wrong hash", signer: rsaSigner, digest: digest[:], opts: crypto.SHA512},
 		{name: "short digest", signer: rsaSigner, digest: digest[:16], opts: crypto.SHA256},
@@ -638,6 +664,48 @@ func TestSignRejectsUnsupportedOptions(t *testing.T) {
 
 			if _, err := testCase.signer.Sign(rand.Reader, testCase.digest, testCase.opts); err == nil {
 				t.Error("expected an error, got none")
+			}
+		})
+	}
+}
+
+// TestAllowSHA1 checks that only an RSA signer can be let sign SHA-1 digests.
+func TestAllowSHA1(t *testing.T) {
+	t.Parallel()
+
+	provider := func() ([]byte, error) { return []byte("123456"), nil }
+
+	rsaSigner, err := New(testKey(t), DefaultDevicePath, provider)
+	if err != nil {
+		t.Fatalf("new signer: %v", err)
+	}
+	eccKey, _ := testECCKey(t)
+	eccSigner, err := New(eccKey, DefaultDevicePath, provider)
+	if err != nil {
+		t.Fatalf("new signer: %v", err)
+	}
+
+	testCases := []struct {
+		name      string
+		signer    *Signer
+		expectErr bool
+	}{
+		{name: "rsa", signer: rsaSigner},
+		{name: "ecc", signer: eccSigner, expectErr: true},
+		{name: "nil", signer: nil, expectErr: true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := testCase.signer.AllowSHA1()
+			if testCase.expectErr != (err != nil) {
+				t.Fatalf("AllowSHA1() error = %v, want an error: %t", err, testCase.expectErr)
+			}
+
+			if testCase.signer != nil && testCase.signer.allowSHA1 == testCase.expectErr {
+				t.Errorf("allowSHA1 = %v", testCase.signer.allowSHA1)
 			}
 		})
 	}
@@ -978,11 +1046,13 @@ func TestLive(t *testing.T) { //nolint:paralleltest // Drives the real TPM, whic
 		name          string
 		keyType       KeyType
 		pin           []byte
+		hash          crypto.Hash
 		checkWrongPIN bool
 	}{
 		{name: "rsa-2048 with pin", keyType: KeyTypeRSA2048, pin: []byte("482913"), checkWrongPIN: true},
 		{name: "ecc-p256 with pin", keyType: KeyTypeECCP256, pin: []byte("482913")},
 		{name: "ecc-p256 without pin", keyType: KeyTypeECCP256},
+		{name: "rsa-2048 without pin over sha-1", keyType: KeyTypeRSA2048, hash: crypto.SHA1},
 	}
 
 	for _, testCase := range testCases { //nolint:paralleltest // Shares the TPM, as above.
@@ -1032,10 +1102,22 @@ func TestLive(t *testing.T) { //nolint:paralleltest // Drives the real TPM, whic
 				t.Fatalf("new signer: %v", err)
 			}
 
-			digest := sha256.Sum256([]byte("hello from the tpm"))
+			hash := crypto.SHA256
+			sum := sha256.Sum256([]byte("hello from the tpm"))
+			digest := sum[:]
+
+			if testCase.hash == crypto.SHA1 {
+				if err := signer.AllowSHA1(); err != nil {
+					t.Fatalf("allow sha-1: %v", err)
+				}
+
+				hash = crypto.SHA1
+				sha1Sum := sha1.Sum([]byte("hello from the tpm")) //nolint:gosec // the digest adb signs
+				digest = sha1Sum[:]
+			}
 
 			start = time.Now()
-			signature, err := signer.Sign(rand.Reader, digest[:], crypto.SHA256)
+			signature, err := signer.Sign(rand.Reader, digest, hash)
 			if err != nil {
 				t.Fatalf("sign: %v", err)
 			}
@@ -1046,14 +1128,14 @@ func TestLive(t *testing.T) { //nolint:paralleltest // Drives the real TPM, whic
 				if testCase.keyType != KeyTypeRSA2048 {
 					t.Fatalf("public key is RSA for a %s key", testCase.keyType)
 				}
-				if err := rsa.VerifyPKCS1v15(publicKey, crypto.SHA256, digest[:], signature); err != nil {
+				if err := rsa.VerifyPKCS1v15(publicKey, hash, digest, signature); err != nil {
 					t.Fatalf("signature does not verify: %v", err)
 				}
 			case *ecdsa.PublicKey:
 				if testCase.keyType != KeyTypeECCP256 {
 					t.Fatalf("public key is ECDSA for a %s key", testCase.keyType)
 				}
-				if !ecdsa.VerifyASN1(publicKey, digest[:], signature) {
+				if !ecdsa.VerifyASN1(publicKey, digest, signature) {
 					t.Fatal("signature does not verify")
 				}
 			default:
@@ -1069,7 +1151,7 @@ func TestLive(t *testing.T) { //nolint:paralleltest // Drives the real TPM, whic
 				if err != nil {
 					t.Fatalf("new signer: %v", err)
 				}
-				if _, err := wrong.Sign(rand.Reader, digest[:], crypto.SHA256); err == nil {
+				if _, err := wrong.Sign(rand.Reader, digest, hash); err == nil {
 					t.Error("a wrong PIN produced a signature")
 				}
 			})

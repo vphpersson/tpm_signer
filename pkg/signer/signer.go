@@ -165,7 +165,8 @@ type Signer struct {
 	devicePath  string
 	pinProvider PINProvider
 	publicKey   crypto.PublicKey
-	scheme      *tpm2.TPMTSigScheme
+	// allowSHA1 lets an RSA key sign SHA-1 digests as well as SHA-256 ones. See AllowSHA1.
+	allowSHA1 bool
 }
 
 // New builds a Signer. The public key is recovered from the key file, so no TPM access is needed
@@ -186,8 +187,7 @@ func New(key *keyfile.Key, devicePath string, pinProvider PINProvider) (*Signer,
 		return nil, altshiftErrors.New(fmt.Errorf("public key: %w", err))
 	}
 
-	scheme, err := signatureScheme(publicKey)
-	if err != nil {
+	if _, err := signatureScheme(publicKey, crypto.SHA256); err != nil {
 		return nil, altshiftErrors.New(fmt.Errorf("signature scheme: %w", err))
 	}
 
@@ -196,8 +196,33 @@ func New(key *keyfile.Key, devicePath string, pinProvider PINProvider) (*Signer,
 		devicePath:  devicePath,
 		pinProvider: pinProvider,
 		publicKey:   publicKey,
-		scheme:      scheme,
 	}, nil
+}
+
+// AllowSHA1 lets the signer sign SHA-1 digests, PKCS #1 v1.5, as well as SHA-256 ones. Only an RSA
+// key can.
+//
+// This is for a protocol that requires it and for nothing else. The Android Debug Bridge proves a
+// host by having it sign twenty random bytes of the device's choosing as though they were a SHA-1
+// digest, so whoever poses as the device chooses the digest, and gets back a signature good for any
+// message with that SHA-1 hash. A key that does this must therefore sign for that protocol alone:
+// keep a key of its own for it, never one that signs anything a SHA-1 signature could be mistaken
+// for.
+func (signer *Signer) AllowSHA1() error {
+	if signer == nil {
+		return nil_error.New("signer")
+	}
+
+	if _, ok := signer.publicKey.(*rsa.PublicKey); !ok {
+		return altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: SHA-1 signatures are for RSA keys only", altshiftErrors.ErrValidationError),
+			fmt.Sprintf("%T", signer.publicKey),
+		)
+	}
+
+	signer.allowSHA1 = true
+
+	return nil
 }
 
 // PublicKey recovers the public key from a key file's public area: an *rsa.PublicKey for an RSA
@@ -312,8 +337,23 @@ func uncompressedPoint(x []byte, y []byte, size int) ([]byte, error) {
 }
 
 // signatureScheme is the scheme Sign asks the TPM for. The keys carry a null scheme, so the choice
-// is made here, from the kind of key: RSASSA-PKCS1-v1_5 for RSA, ECDSA for ECC, SHA-256 for both.
-func signatureScheme(publicKey crypto.PublicKey) (*tpm2.TPMTSigScheme, error) {
+// is made here, from the kind of key — RSASSA-PKCS1-v1_5 for RSA, ECDSA for ECC — and the hash the
+// digest was made with: SHA-256, or SHA-1 for an RSA key whose signer allows it.
+func signatureScheme(publicKey crypto.PublicKey, hash crypto.Hash) (*tpm2.TPMTSigScheme, error) {
+	var hashAlgorithm tpm2.TPMAlgID
+
+	switch hash {
+	case crypto.SHA256:
+		hashAlgorithm = tpm2.TPMAlgSHA256
+	case crypto.SHA1:
+		hashAlgorithm = tpm2.TPMAlgSHA1
+	default:
+		return nil, altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: unsupported hash", altshiftErrors.ErrValidationError),
+			hash.String(),
+		)
+	}
+
 	var algorithm tpm2.TPMAlgID
 	switch publicKey.(type) {
 	case *rsa.PublicKey:
@@ -327,9 +367,15 @@ func signatureScheme(publicKey crypto.PublicKey) (*tpm2.TPMTSigScheme, error) {
 		)
 	}
 
+	if hash == crypto.SHA1 && algorithm != tpm2.TPMAlgRSASSA {
+		return nil, altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: SHA-1 signatures are for RSA keys only", altshiftErrors.ErrValidationError),
+		)
+	}
+
 	return &tpm2.TPMTSigScheme{
 		Scheme:  algorithm,
-		Details: tpm2.NewTPMUSigScheme(algorithm, &tpm2.TPMSSchemeHash{HashAlg: tpm2.TPMAlgSHA256}),
+		Details: tpm2.NewTPMUSigScheme(algorithm, &tpm2.TPMSSchemeHash{HashAlg: hashAlgorithm}),
 	}, nil
 }
 
@@ -392,7 +438,8 @@ func (signer *Signer) Public() crypto.PublicKey {
 
 // Sign implements crypto.Signer over a SHA-256 digest: RSASSA-PKCS1-v1_5 for an RSA key, which is
 // what RS256 needs, and ECDSA for a P-256 key, returned ASN.1 DER encoded as crypto.Signer requires.
-// The rand argument is ignored because the TPM supplies its own entropy.
+// An RSA signer that AllowSHA1 was called on also signs a SHA-1 digest. The rand argument is ignored
+// because the TPM supplies its own entropy.
 func (signer *Signer) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
 	if opts == nil {
 		return nil, nil_error.New("opts")
@@ -402,17 +449,24 @@ func (signer *Signer) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (
 			fmt.Errorf("%w: PSS is not supported", altshiftErrors.ErrValidationError),
 		)
 	}
-	if opts.HashFunc() != crypto.SHA256 {
+
+	hash := opts.HashFunc()
+	if hash != crypto.SHA256 && (hash != crypto.SHA1 || !signer.allowSHA1) {
 		return nil, altshiftErrors.NewWithTrace(
 			fmt.Errorf("%w: unsupported hash", altshiftErrors.ErrValidationError),
-			opts.HashFunc().String(),
+			hash.String(),
 		)
 	}
-	if len(digest) != sha256.Size {
+	if len(digest) != hash.Size() {
 		return nil, altshiftErrors.NewWithTrace(
 			fmt.Errorf("%w: unexpected digest length", altshiftErrors.ErrValidationError),
 			len(digest),
 		)
+	}
+
+	scheme, err := signatureScheme(signer.publicKey, hash)
+	if err != nil {
+		return nil, altshiftErrors.New(fmt.Errorf("signature scheme: %w", err))
 	}
 
 	public, err := tpm2.Unmarshal[tpm2.TPM2BPublic](signer.key.Public)
@@ -499,7 +553,7 @@ func (signer *Signer) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (
 			Auth:   session,
 		},
 		Digest:     tpm2.TPM2BDigest{Buffer: digest},
-		InScheme:   *signer.scheme,
+		InScheme:   *scheme,
 		Validation: tpm2.TPMTTKHashCheck{Tag: tpm2.TPMSTHashCheck},
 	}.Execute(device)
 	if err != nil {
