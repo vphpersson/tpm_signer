@@ -1,5 +1,5 @@
-github.com/altshiftab/utils_go v1.125.1 h1:53jkuJ71w/qPoWNAo43KsjTa36uuG1AC9mD4GFOGw4I=
-github.com/altshiftab/utils_go v1.125.1/go.mod h1:lNBqVAWMIhIISNz0pOQnsqRsCPg6S50Q62GH6slGBOk=
+github.com/altshiftab/utils_go v1.129.0 h1:l+PEQ3/0StF7buewQUyCBG4mI+uBUAkS1huiFC55wE8=
+github.com/altshiftab/utils_go v1.129.0/go.mod h1:lNBqVAWMIhIISNz0pOQnsqRsCPg6S50Q62GH6slGBOk=
 github.com/google/go-tpm v0.9.8 h1:slArAR9Ft+1ybZu0lBwpSmpwhRXaa85hWtMinMyRAWo=
 github.com/google/go-tpm v0.9.8/go.mod h1:h9jEsEECg7gtLis0upRBQU+GhYVH6jMjrFxI8u6bVUY=
 github.com/google/go-tpm-tools v0.3.13-0.20230620182252-4639ecce2aba h1:qJEJcuLzH5KDR0gKc0zcktin6KSAwL7+jWKBYceddTc=
