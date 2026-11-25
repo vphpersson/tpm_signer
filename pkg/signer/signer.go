@@ -187,7 +187,7 @@ func New(key *keyfile.Key, devicePath string, pinProvider PINProvider) (*Signer,
 		return nil, altshiftErrors.New(fmt.Errorf("public key: %w", err))
 	}
 
-	if _, err := signatureScheme(publicKey, crypto.SHA256); err != nil {
+	if _, err := signatureScheme(publicKey, crypto.SHA256, false); err != nil {
 		return nil, altshiftErrors.New(fmt.Errorf("signature scheme: %w", err))
 	}
 
@@ -338,8 +338,9 @@ func uncompressedPoint(x []byte, y []byte, size int) ([]byte, error) {
 
 // signatureScheme is the scheme Sign asks the TPM for. The keys carry a null scheme, so the choice
 // is made here, from the kind of key — RSASSA-PKCS1-v1_5 for RSA, ECDSA for ECC — and the hash the
-// digest was made with: SHA-256, or SHA-1 for an RSA key whose signer allows it.
-func signatureScheme(publicKey crypto.PublicKey, hash crypto.Hash) (*tpm2.TPMTSigScheme, error) {
+// digest was made with: SHA-256, or SHA-1 for an RSA key whose signer allows it. pss asks for
+// RSASSA-PSS instead, which only an RSA key over SHA-256 makes.
+func signatureScheme(publicKey crypto.PublicKey, hash crypto.Hash, pss bool) (*tpm2.TPMTSigScheme, error) {
 	var hashAlgorithm tpm2.TPMAlgID
 
 	switch hash {
@@ -373,6 +374,17 @@ func signatureScheme(publicKey crypto.PublicKey, hash crypto.Hash) (*tpm2.TPMTSi
 		)
 	}
 
+	if pss {
+		if algorithm != tpm2.TPMAlgRSASSA || hash != crypto.SHA256 {
+			return nil, altshiftErrors.NewWithTrace(
+				fmt.Errorf("%w: PSS signatures are for RSA keys over SHA-256 only", altshiftErrors.ErrValidationError),
+				hash.String(),
+			)
+		}
+
+		algorithm = tpm2.TPMAlgRSAPSS
+	}
+
 	return &tpm2.TPMTSigScheme{
 		Scheme:  algorithm,
 		Details: tpm2.NewTPMUSigScheme(algorithm, &tpm2.TPMSSchemeHash{HashAlg: hashAlgorithm}),
@@ -386,12 +398,21 @@ type ecdsaSignature struct {
 	S *big.Int
 }
 
-// encodeSignature renders the TPM's signature in the form crypto.Signer promises: the raw
-// PKCS #1 v1.5 signature for RSA, and the ASN.1 DER encoding of r and s for ECDSA. A JWS wants
-// r || s instead; converting is the caller's business, as it is for any other crypto.Signer.
-func encodeSignature(signature *tpm2.TPMTSignature) ([]byte, error) {
+// encodeSignature renders the TPM's signature, made with the scheme want, in the form
+// crypto.Signer promises: the raw signature for RSA, PKCS #1 v1.5 or PSS, and the ASN.1 DER
+// encoding of r and s for ECDSA. A JWS wants r || s instead; converting is the caller's business,
+// as it is for any other crypto.Signer.
+func encodeSignature(signature *tpm2.TPMTSignature, want tpm2.TPMAlgID) ([]byte, error) {
 	if signature == nil {
 		return nil, nil_error.New("signature")
+	}
+
+	if signature.SigAlg != want {
+		return nil, altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: a signature made with another scheme than asked for", altshiftErrors.ErrValidationError),
+			signature.SigAlg,
+			want,
+		)
 	}
 
 	switch signature.SigAlg {
@@ -402,6 +423,13 @@ func encodeSignature(signature *tpm2.TPMTSignature) ([]byte, error) {
 		}
 
 		return rsassa.Sig.Buffer, nil
+	case tpm2.TPMAlgRSAPSS:
+		rsapss, err := signature.Signature.RSAPSS()
+		if err != nil {
+			return nil, altshiftErrors.NewWithTrace(fmt.Errorf("rsapss signature: %w", err))
+		}
+
+		return rsapss.Sig.Buffer, nil
 	case tpm2.TPMAlgECDSA:
 		ecdsaSigned, err := signature.Signature.ECDSA()
 		if err != nil {
@@ -440,13 +468,21 @@ func (signer *Signer) Public() crypto.PublicKey {
 // what RS256 needs, and ECDSA for a P-256 key, returned ASN.1 DER encoded as crypto.Signer requires.
 // An RSA signer that AllowSHA1 was called on also signs a SHA-1 digest. The rand argument is ignored
 // because the TPM supplies its own entropy.
+//
+// *rsa.PSSOptions asks an RSA key for RSASSA-PSS over SHA-256, which TLS 1.3 requires, with a salt
+// the length of the hash: rsa.PSSSaltLengthEqualsHash or 32, the only length a TPM is held to. The
+// specification lets a chip use a longer one, which TLS refuses, so the signature is verified at
+// that length before it is returned.
 func (signer *Signer) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
 	if opts == nil {
 		return nil, nil_error.New("opts")
 	}
-	if _, isPSS := opts.(*rsa.PSSOptions); isPSS {
+
+	pss, isPSS := opts.(*rsa.PSSOptions)
+	if isPSS && pss.SaltLength != rsa.PSSSaltLengthEqualsHash && pss.SaltLength != crypto.SHA256.Size() {
 		return nil, altshiftErrors.NewWithTrace(
-			fmt.Errorf("%w: PSS is not supported", altshiftErrors.ErrValidationError),
+			fmt.Errorf("%w: a PSS salt length other than the hash's", altshiftErrors.ErrValidationError),
+			pss.SaltLength,
 		)
 	}
 
@@ -464,7 +500,7 @@ func (signer *Signer) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (
 		)
 	}
 
-	scheme, err := signatureScheme(signer.publicKey, hash)
+	scheme, err := signatureScheme(signer.publicKey, hash, isPSS)
 	if err != nil {
 		return nil, altshiftErrors.New(fmt.Errorf("signature scheme: %w", err))
 	}
@@ -560,12 +596,40 @@ func (signer *Signer) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (
 		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("tpm sign: %w", err))
 	}
 
-	signature, err := encodeSignature(&signed.Signature)
+	signature, err := encodeSignature(&signed.Signature, scheme.Scheme)
 	if err != nil {
 		return nil, altshiftErrors.New(fmt.Errorf("encode signature: %w", err))
 	}
 
+	if isPSS {
+		if err := checkPSSSaltLength(signer.publicKey, digest, signature); err != nil {
+			return nil, err
+		}
+	}
+
 	return signature, nil
+}
+
+// checkPSSSaltLength verifies a PSS signature over a SHA-256 digest with a salt the length of the
+// hash, so that a chip that chose a longer salt is reported as such rather than as a failed TLS
+// handshake.
+func checkPSSSaltLength(publicKey crypto.PublicKey, digest []byte, signature []byte) error {
+	rsaPublic, ok := publicKey.(*rsa.PublicKey)
+	if !ok {
+		return altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: a PSS signature from a key that is not RSA", altshiftErrors.ErrValidationError),
+		)
+	}
+
+	err := rsa.VerifyPSS(rsaPublic, crypto.SHA256, digest, signature, &rsa.PSSOptions{SaltLength: crypto.SHA256.Size()})
+	if err != nil {
+		return altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: the TPM's PSS signature does not verify with a salt the length of the hash, "+
+				"the only length TLS accepts: %w", altshiftErrors.ErrVerificationError, err),
+		)
+	}
+
+	return nil
 }
 
 // authValue is the PIN for one signature: a copy of what the provider returned, for Sign to zero.

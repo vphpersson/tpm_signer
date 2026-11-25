@@ -385,10 +385,14 @@ func TestSignatureScheme(t *testing.T) {
 		name      string
 		publicKey crypto.PublicKey
 		hash      crypto.Hash
+		pss       bool
 		expectErr bool
 		want      tpm2.TPMAlgID
 		wantHash  tpm2.TPMAlgID
 	}{
+		{name: "rsa signs with rsapss when asked", publicKey: &rsaKey.PublicKey, hash: crypto.SHA256, pss: true, want: tpm2.TPMAlgRSAPSS, wantHash: tpm2.TPMAlgSHA256},
+		{name: "rsapss never over sha-1", publicKey: &rsaKey.PublicKey, hash: crypto.SHA1, pss: true, expectErr: true},
+		{name: "ecc never with pss", publicKey: &eccKey.PublicKey, hash: crypto.SHA256, pss: true, expectErr: true},
 		{name: "rsa signs with rsassa", publicKey: &rsaKey.PublicKey, hash: crypto.SHA256, want: tpm2.TPMAlgRSASSA, wantHash: tpm2.TPMAlgSHA256},
 		{name: "rsa over sha-1", publicKey: &rsaKey.PublicKey, hash: crypto.SHA1, want: tpm2.TPMAlgRSASSA, wantHash: tpm2.TPMAlgSHA1},
 		{name: "ecc signs with ecdsa", publicKey: &eccKey.PublicKey, hash: crypto.SHA256, want: tpm2.TPMAlgECDSA, wantHash: tpm2.TPMAlgSHA256},
@@ -402,7 +406,7 @@ func TestSignatureScheme(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			scheme, err := signatureScheme(testCase.publicKey, testCase.hash)
+			scheme, err := signatureScheme(testCase.publicKey, testCase.hash, testCase.pss)
 			if testCase.expectErr {
 				if err == nil {
 					t.Fatal("expected an error, got none")
@@ -420,6 +424,8 @@ func TestSignatureScheme(t *testing.T) {
 			switch testCase.want {
 			case tpm2.TPMAlgRSASSA:
 				details, err = scheme.Details.RSASSA()
+			case tpm2.TPMAlgRSAPSS:
+				details, err = scheme.Details.RSAPSS()
 			case tpm2.TPMAlgECDSA:
 				details, err = scheme.Details.ECDSA()
 			default:
@@ -450,6 +456,10 @@ func TestEncodeSignature(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rsa sign: %v", err)
 	}
+	pssSignature, err := rsa.SignPSS(rand.Reader, rsaKey, crypto.SHA256, digest[:], &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
+	if err != nil {
+		t.Fatalf("rsa sign pss: %v", err)
+	}
 
 	eccKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -478,9 +488,25 @@ func TestEncodeSignature(t *testing.T) {
 	testCases := []struct {
 		name      string
 		signature *tpm2.TPMTSignature
+		// want is the scheme asked for: RSASSA unless set.
+		want      tpm2.TPMAlgID
 		expectErr bool
 		verify    func([]byte) bool
 	}{
+		{
+			name: "rsapss is passed through",
+			signature: &tpm2.TPMTSignature{
+				SigAlg: tpm2.TPMAlgRSAPSS,
+				Signature: tpm2.NewTPMUSignature(tpm2.TPMAlgRSAPSS, &tpm2.TPMSSignatureRSA{
+					Hash: tpm2.TPMAlgSHA256,
+					Sig:  tpm2.TPM2BPublicKeyRSA{Buffer: pssSignature},
+				}),
+			},
+			want: tpm2.TPMAlgRSAPSS,
+			verify: func(signature []byte) bool {
+				return rsa.VerifyPSS(&rsaKey.PublicKey, crypto.SHA256, digest[:], signature, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash}) == nil
+			},
+		},
 		{
 			name: "rsassa is passed through",
 			signature: &tpm2.TPMTSignature{
@@ -497,6 +523,7 @@ func TestEncodeSignature(t *testing.T) {
 		{
 			name:      "ecdsa is der encoded",
 			signature: ecdsaTPMSignature(parsed.R.Bytes(), parsed.S.Bytes()),
+			want:      tpm2.TPMAlgECDSA,
 			verify: func(signature []byte) bool {
 				return ecdsa.VerifyASN1(&eccKey.PublicKey, digest[:], signature)
 			},
@@ -505,12 +532,13 @@ func TestEncodeSignature(t *testing.T) {
 			// A TPM returns r and s at the full field width; the INTEGERs must still be minimal.
 			name:      "ecdsa with zero-padded r and s",
 			signature: ecdsaTPMSignature(parsed.R.FillBytes(make([]byte, 33)), parsed.S.FillBytes(make([]byte, 33))),
+			want:      tpm2.TPMAlgECDSA,
 			verify: func(signature []byte) bool {
 				return ecdsa.VerifyASN1(&eccKey.PublicKey, digest[:], signature) && bytes.Equal(signature, der)
 			},
 		},
-		{name: "ecdsa with zero r", signature: ecdsaTPMSignature([]byte{0}, parsed.S.Bytes()), expectErr: true},
-		{name: "ecdsa with empty s", signature: ecdsaTPMSignature(parsed.R.Bytes(), nil), expectErr: true},
+		{name: "ecdsa with zero r", signature: ecdsaTPMSignature([]byte{0}, parsed.S.Bytes()), want: tpm2.TPMAlgECDSA, expectErr: true},
+		{name: "ecdsa with empty s", signature: ecdsaTPMSignature(parsed.R.Bytes(), nil), want: tpm2.TPMAlgECDSA, expectErr: true},
 		{
 			name: "rsapss is not what was asked for",
 			signature: &tpm2.TPMTSignature{
@@ -529,7 +557,12 @@ func TestEncodeSignature(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			encoded, err := encodeSignature(testCase.signature)
+			want := testCase.want
+			if want == 0 {
+				want = tpm2.TPMAlgRSASSA
+			}
+
+			encoded, err := encodeSignature(testCase.signature, want)
 			if testCase.expectErr {
 				if err == nil {
 					t.Fatal("expected an error, got none")
@@ -595,7 +628,7 @@ func TestNew(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			scheme, err := signatureScheme(signer.Public(), crypto.SHA256)
+			scheme, err := signatureScheme(signer.Public(), crypto.SHA256, false)
 			if err != nil {
 				t.Fatalf("signature scheme: %v", err)
 			}
@@ -648,7 +681,10 @@ func TestSignRejectsUnsupportedOptions(t *testing.T) {
 		{name: "sha-1 allowed, but a sha-256 length", signer: sha1Signer, digest: digest[:], opts: crypto.SHA1},
 		{name: "sha-1 allowed, still no other hash", signer: sha1Signer, digest: digest[:], opts: crypto.SHA512},
 		{name: "ecc sha-1", signer: eccSigner, digest: sha1Digest[:], opts: crypto.SHA1},
-		{name: "pss is not supported", signer: rsaSigner, digest: digest[:], opts: &rsa.PSSOptions{Hash: crypto.SHA256}},
+		{name: "pss with a salt the tpm need not make", signer: rsaSigner, digest: digest[:], opts: &rsa.PSSOptions{Hash: crypto.SHA256, SaltLength: rsa.PSSSaltLengthAuto}},
+		{name: "pss with a salt of another length", signer: rsaSigner, digest: digest[:], opts: &rsa.PSSOptions{Hash: crypto.SHA256, SaltLength: 20}},
+		{name: "pss over sha-512", signer: rsaSigner, digest: digest[:], opts: &rsa.PSSOptions{Hash: crypto.SHA512, SaltLength: rsa.PSSSaltLengthEqualsHash}},
+		{name: "pss over sha-1", signer: sha1Signer, digest: sha1Digest[:], opts: &rsa.PSSOptions{Hash: crypto.SHA1, SaltLength: rsa.PSSSaltLengthEqualsHash}},
 		{name: "wrong hash", signer: rsaSigner, digest: digest[:], opts: crypto.SHA512},
 		{name: "short digest", signer: rsaSigner, digest: digest[:16], opts: crypto.SHA256},
 		{name: "ecc nil opts", signer: eccSigner, digest: digest[:], opts: nil},
@@ -662,8 +698,14 @@ func TestSignRejectsUnsupportedOptions(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			if _, err := testCase.signer.Sign(rand.Reader, testCase.digest, testCase.opts); err == nil {
-				t.Error("expected an error, got none")
+			_, err := testCase.signer.Sign(rand.Reader, testCase.digest, testCase.opts)
+			if err == nil {
+				t.Fatal("expected an error, got none")
+			}
+
+			// Refused before the TPM is asked: the test key would fail there too, for other reasons.
+			if _, isPSS := testCase.opts.(*rsa.PSSOptions); isPSS && !errors.Is(err, altshiftErrors.ErrValidationError) {
+				t.Errorf("Sign() error = %v, want a validation error", err)
 			}
 		})
 	}
@@ -1047,12 +1089,14 @@ func TestLive(t *testing.T) { //nolint:paralleltest // Drives the real TPM, whic
 		keyType       KeyType
 		pin           []byte
 		hash          crypto.Hash
+		pss           bool
 		checkWrongPIN bool
 	}{
 		{name: "rsa-2048 with pin", keyType: KeyTypeRSA2048, pin: []byte("482913"), checkWrongPIN: true},
 		{name: "ecc-p256 with pin", keyType: KeyTypeECCP256, pin: []byte("482913")},
 		{name: "ecc-p256 without pin", keyType: KeyTypeECCP256},
 		{name: "rsa-2048 without pin over sha-1", keyType: KeyTypeRSA2048, hash: crypto.SHA1},
+		{name: "rsa-2048 without pin, pss as tls 1.3 asks", keyType: KeyTypeRSA2048, pss: true},
 	}
 
 	for _, testCase := range testCases { //nolint:paralleltest // Shares the TPM, as above.
@@ -1116,8 +1160,13 @@ func TestLive(t *testing.T) { //nolint:paralleltest // Drives the real TPM, whic
 				digest = sha1Sum[:]
 			}
 
+			var opts crypto.SignerOpts = hash
+			if testCase.pss {
+				opts = &rsa.PSSOptions{Hash: crypto.SHA256, SaltLength: rsa.PSSSaltLengthEqualsHash}
+			}
+
 			start = time.Now()
-			signature, err := signer.Sign(rand.Reader, digest, hash)
+			signature, err := signer.Sign(rand.Reader, digest, opts)
 			if err != nil {
 				t.Fatalf("sign: %v", err)
 			}
@@ -1128,7 +1177,16 @@ func TestLive(t *testing.T) { //nolint:paralleltest // Drives the real TPM, whic
 				if testCase.keyType != KeyTypeRSA2048 {
 					t.Fatalf("public key is RSA for a %s key", testCase.keyType)
 				}
-				if err := rsa.VerifyPKCS1v15(publicKey, hash, digest, signature); err != nil {
+
+				verify := func() error { return rsa.VerifyPKCS1v15(publicKey, hash, digest, signature) }
+				if testCase.pss {
+					// As crypto/tls verifies a TLS 1.3 CertificateVerify.
+					verify = func() error {
+						return rsa.VerifyPSS(publicKey, crypto.SHA256, digest, signature, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
+					}
+				}
+
+				if err := verify(); err != nil {
 					t.Fatalf("signature does not verify: %v", err)
 				}
 			case *ecdsa.PublicKey:
@@ -1155,6 +1213,55 @@ func TestLive(t *testing.T) { //nolint:paralleltest // Drives the real TPM, whic
 					t.Error("a wrong PIN produced a signature")
 				}
 			})
+		})
+	}
+}
+
+// TestCheckPSSSaltLength checks that a PSS signature is accepted only with a salt the length of
+// the hash, as TLS 1.3 verifies it: a chip that chose a longer one is caught here.
+func TestCheckPSSSaltLength(t *testing.T) {
+	t.Parallel()
+
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	eccKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	digest := sha256.Sum256([]byte("payload"))
+
+	sign := func(saltLength int) []byte {
+		signature, err := rsa.SignPSS(rand.Reader, rsaKey, crypto.SHA256, digest[:], &rsa.PSSOptions{SaltLength: saltLength})
+		if err != nil {
+			t.Fatalf("sign pss: %v", err)
+		}
+
+		return signature
+	}
+
+	testCases := []struct {
+		name      string
+		publicKey crypto.PublicKey
+		signature []byte
+		expectErr bool
+	}{
+		{name: "a salt the length of the hash", publicKey: &rsaKey.PublicKey, signature: sign(32)},
+		{name: "a longer salt", publicKey: &rsaKey.PublicKey, signature: sign(64), expectErr: true},
+		{name: "the longest salt", publicKey: &rsaKey.PublicKey, signature: sign(rsa.PSSSaltLengthAuto), expectErr: true},
+		{name: "not rsa", publicKey: &eccKey.PublicKey, signature: sign(32), expectErr: true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := checkPSSSaltLength(testCase.publicKey, digest[:], testCase.signature)
+			if (err != nil) != testCase.expectErr {
+				t.Errorf("checkPSSSaltLength() error = %v, want an error: %t", err, testCase.expectErr)
+			}
 		})
 	}
 }
