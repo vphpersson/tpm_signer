@@ -479,6 +479,10 @@ func (signer *Signer) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (
 	}
 
 	pss, isPSS := opts.(*rsa.PSSOptions)
+	if isPSS && pss == nil {
+		return nil, nil_error.New("pss options")
+	}
+
 	if isPSS && pss.SaltLength != rsa.PSSSaltLengthEqualsHash && pss.SaltLength != crypto.SHA256.Size() {
 		return nil, altshiftErrors.NewWithTrace(
 			fmt.Errorf("%w: a PSS salt length other than the hash's", altshiftErrors.ErrValidationError),

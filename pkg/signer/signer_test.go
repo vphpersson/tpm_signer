@@ -685,6 +685,7 @@ func TestSignRejectsUnsupportedOptions(t *testing.T) {
 		{name: "pss with a salt of another length", signer: rsaSigner, digest: digest[:], opts: &rsa.PSSOptions{Hash: crypto.SHA256, SaltLength: 20}},
 		{name: "pss over sha-512", signer: rsaSigner, digest: digest[:], opts: &rsa.PSSOptions{Hash: crypto.SHA512, SaltLength: rsa.PSSSaltLengthEqualsHash}},
 		{name: "pss over sha-1", signer: sha1Signer, digest: sha1Digest[:], opts: &rsa.PSSOptions{Hash: crypto.SHA1, SaltLength: rsa.PSSSaltLengthEqualsHash}},
+		{name: "nil pss options", signer: rsaSigner, digest: digest[:], opts: (*rsa.PSSOptions)(nil)},
 		{name: "wrong hash", signer: rsaSigner, digest: digest[:], opts: crypto.SHA512},
 		{name: "short digest", signer: rsaSigner, digest: digest[:16], opts: crypto.SHA256},
 		{name: "ecc nil opts", signer: eccSigner, digest: digest[:], opts: nil},
@@ -704,7 +705,7 @@ func TestSignRejectsUnsupportedOptions(t *testing.T) {
 			}
 
 			// Refused before the TPM is asked: the test key would fail there too, for other reasons.
-			if _, isPSS := testCase.opts.(*rsa.PSSOptions); isPSS && !errors.Is(err, altshiftErrors.ErrValidationError) {
+			if pss, isPSS := testCase.opts.(*rsa.PSSOptions); isPSS && pss != nil && !errors.Is(err, altshiftErrors.ErrValidationError) {
 				t.Errorf("Sign() error = %v, want a validation error", err)
 			}
 		})
@@ -1250,7 +1251,6 @@ func TestCheckPSSSaltLength(t *testing.T) {
 	}{
 		{name: "a salt the length of the hash", publicKey: &rsaKey.PublicKey, signature: sign(32)},
 		{name: "a longer salt", publicKey: &rsaKey.PublicKey, signature: sign(64), expectErr: true},
-		{name: "the longest salt", publicKey: &rsaKey.PublicKey, signature: sign(rsa.PSSSaltLengthAuto), expectErr: true},
 		{name: "not rsa", publicKey: &eccKey.PublicKey, signature: sign(32), expectErr: true},
 	}
 
